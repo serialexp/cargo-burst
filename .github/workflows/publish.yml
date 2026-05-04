@@ -1,0 +1,52 @@
+name: publish
+
+# Triggered by pushing a version tag like `v0.1.1`. We don't auto-publish
+# on every push to master — tagging is the explicit "this is a release"
+# signal. Workflow_dispatch lets you re-run the publish manually from the
+# Actions tab if a transient registry hiccup needs a retry (only useful
+# for a not-yet-published version, since crates.io is append-only).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain is the maintained, no-frills way to get
+        # rustup into a runner. `stable` tracks the latest stable; pin to
+        # a specific version (e.g. `1.83.0`) if you ever want reproducible
+        # publishes across runs.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify version matches tag
+        # Belt-and-braces: refuse to publish if the tag (e.g. v0.1.1)
+        # doesn't match the version in Cargo.toml. Stops a stale tag
+        # from accidentally re-publishing whatever's currently in the
+        # manifest.
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[0].version')
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version"
+            exit 1
+          fi
+        if: github.event_name == 'push'
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        # --locked uses Cargo.lock as-committed (matches what you tested
+        # locally). No --dry-run here — this is the real publish.
+        run: cargo publish --locked
