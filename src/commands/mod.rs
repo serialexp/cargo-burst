@@ -8,6 +8,7 @@ pub mod check;
 pub mod clippy;
 pub mod down;
 pub mod image;
+pub mod install;
 pub mod reap;
 pub mod remote;
 pub mod status;

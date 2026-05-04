@@ -59,6 +59,10 @@ enum Command {
     Status,
     /// Delete the running server now (volume is preserved).
     Down,
+    /// Write usage instructions for cargo-burst into `~/.claude/CLAUDE.md`
+    /// so Claude Code knows when and how to reach for it. Idempotent —
+    /// re-run after upgrading to refresh the instructions block.
+    Install,
     /// Internal: detached reaper used by `build` to delete the shared
     /// server after the keep-alive timer expires. Not a user-facing command.
     #[command(name = "__reap-server", hide = true)]
@@ -110,6 +114,7 @@ async fn main() -> Result<()> {
         Command::Bench(args) => commands::bench::run(args).await,
         Command::Status => commands::status::run().await,
         Command::Down => commands::down::run().await,
+        Command::Install => commands::install::run().await,
         Command::ReapServer(args) => commands::reap::run_server(args).await,
         Command::ReapVolume(args) => commands::reap::run_volume(args).await,
     }
