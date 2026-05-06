@@ -1,6 +1,6 @@
 [package]
 name = "cargo-burst"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Bart Riepe <bart@serial-experiments.com>"]
 description = "Spin up a Hetzner Cloud server on demand for cargo builds; persistent per-project volume keeps target/ warm between sessions."

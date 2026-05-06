@@ -6,6 +6,7 @@
 //! the binary small.
 
 use anyhow::{Context, Result, anyhow};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,16 +17,66 @@ use tokio::process::Command;
 /// checking and known_hosts persistence — these are short-lived servers
 /// reachable only via the IP Hetzner just allocated to us, and pinning a
 /// host key per session would just produce noise.
-fn base_ssh_opts(key_path: &Path) -> Vec<String> {
+///
+/// Connection multiplexing is on (`ControlMaster=auto`,
+/// `ControlPersist=120s`): the first ssh/rsync invocation against a host
+/// opens a master connection, and every subsequent one reuses the existing
+/// TCP+crypto channel via a Unix socket. From a high-RTT location (Japan →
+/// Helsinki ≈ 280 ms) this turns the per-invocation handshake from ~1.5–3 s
+/// into <50 ms. ControlPersist keeps the socket alive briefly between
+/// invocations so back-to-back `cargo burst check` runs benefit too.
+fn base_ssh_opts(key_path: &Path, host: &str) -> Vec<String> {
+    let cm = control_socket_path(host);
     vec![
         "-o".into(), "StrictHostKeyChecking=no".into(),
         "-o".into(), "UserKnownHostsFile=/dev/null".into(),
         "-o".into(), "LogLevel=ERROR".into(),
         "-o".into(), "ConnectTimeout=10".into(),
         "-o".into(), "ServerAliveInterval=30".into(),
+        "-o".into(), "ControlMaster=auto".into(),
+        "-o".into(), format!("ControlPath={}", cm.display()),
+        "-o".into(), "ControlPersist=120s".into(),
         "-i".into(), key_path.display().to_string(),
     ]
 }
+
+/// Compute the Unix socket path used for ssh ControlMaster multiplexing
+/// for a given host.
+///
+/// Constraints:
+/// - Unix domain socket paths cap at ~104–108 chars depending on OS, so
+///   `~/Library/Application Support/dev.serialexp.cargo-burst/` plus a
+///   SHA-256 of host+user+port (40+ chars from ssh's `%C` token) blows
+///   past the macOS limit. We sidestep the whole problem by anchoring
+///   under `/tmp/cargo-burst-<user>/` (< 30 chars on every platform we
+///   target) and using a short hash we control.
+/// - The socket dir is per-user to avoid collisions on multi-user boxes,
+///   and per-host so two cargo-burst sessions targeting different
+///   servers don't trample each other.
+///
+/// `mkdir -p` on the parent dir is best-effort here; if it fails ssh
+/// will surface the error on first connect and the user gets a real
+/// diagnostic instead of a panic.
+fn control_socket_path(host: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(host.as_bytes());
+    let digest = hasher.finalize();
+    // 8 bytes = 16 hex chars: plenty for collision avoidance among the
+    // <10 hosts a single user could plausibly have alive at once.
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
+    let dir = PathBuf::from("/tmp").join(format!("cargo-burst-{user}"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!("cm-{short}.sock"))
+}
+
+// Note: we deliberately don't expose a `close_control_master` helper.
+// `ControlPersist=120s` reaps the socket within two minutes of the last
+// client exit, the per-host hash means a recycled IP almost certainly
+// produces a different socket name, and OpenSSH gracefully falls back
+// to a fresh connection if it ever finds a master pointing at a corpse.
+// The added complexity of looking up the live IP before each `delete_server`
+// call to send `ssh -O exit` isn't worth it.
 
 /// Wait for SSH to come up on a freshly-booted host.
 ///
@@ -69,7 +120,7 @@ pub async fn wait_for_ssh(
                 drop(stream);
                 // Phase 2: real ssh handshake.
                 let mut cmd = Command::new("ssh");
-                cmd.args(base_ssh_opts(key_path));
+                cmd.args(base_ssh_opts(key_path, host));
                 cmd.arg(format!("{user}@{host}"));
                 cmd.arg("true");
                 cmd.stdout(Stdio::null())
@@ -108,7 +159,7 @@ pub async fn run_remote(
     remote_cmd: &str,
 ) -> Result<std::process::ExitStatus> {
     let mut cmd = Command::new("ssh");
-    cmd.args(base_ssh_opts(key_path));
+    cmd.args(base_ssh_opts(key_path, host));
     cmd.arg(format!("{user}@{host}"));
     cmd.arg(remote_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
@@ -144,7 +195,7 @@ pub async fn capture_remote(
     remote_cmd: &str,
 ) -> Result<String> {
     let mut cmd = Command::new("ssh");
-    cmd.args(base_ssh_opts(key_path));
+    cmd.args(base_ssh_opts(key_path, host));
     cmd.arg(format!("{user}@{host}"));
     cmd.arg(remote_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
@@ -188,7 +239,7 @@ pub async fn rsync_to(
     cmd.arg("-e");
     let ssh_inner = {
         let mut s = String::from("ssh");
-        for opt in base_ssh_opts(key_path) {
+        for opt in base_ssh_opts(key_path, host) {
             s.push(' ');
             // Quote any opt containing whitespace.
             if opt.contains(char::is_whitespace) {
@@ -257,7 +308,7 @@ pub async fn rsync_from(
     cmd.arg("-e");
     let ssh_inner = {
         let mut s = String::from("ssh");
-        for opt in base_ssh_opts(key_path) {
+        for opt in base_ssh_opts(key_path, host) {
             s.push(' ');
             if opt.contains(char::is_whitespace) {
                 s.push('"'); s.push_str(&opt); s.push('"');
@@ -336,3 +387,39 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     "*.swp",
     ".DS_Store",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_socket_path_is_per_host_and_short() {
+        let a = control_socket_path("1.2.3.4");
+        let b = control_socket_path("5.6.7.8");
+        let a2 = control_socket_path("1.2.3.4");
+        // Different hosts → different paths.
+        assert_ne!(a, b);
+        // Same host → stable path (so a second invocation reuses the
+        // existing master rather than opening a new one).
+        assert_eq!(a, a2);
+        // Comfortably under macOS's ~104-byte sun_path limit even with
+        // a long username.
+        assert!(
+            a.as_os_str().len() < 90,
+            "control socket path too long: {} ({} chars)",
+            a.display(),
+            a.as_os_str().len()
+        );
+        // Should be a real .sock under /tmp/cargo-burst-<user>/.
+        assert!(a.starts_with("/tmp/"));
+        assert!(a.extension().is_some_and(|e| e == "sock"));
+    }
+
+    #[test]
+    fn base_ssh_opts_includes_control_master() {
+        let opts = base_ssh_opts(Path::new("/tmp/key"), "1.2.3.4");
+        assert!(opts.iter().any(|o| o == "ControlMaster=auto"));
+        assert!(opts.iter().any(|o| o == "ControlPersist=120s"));
+        assert!(opts.iter().any(|o| o.starts_with("ControlPath=")));
+    }
+}
