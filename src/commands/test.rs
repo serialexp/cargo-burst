@@ -131,8 +131,16 @@ pub async fn run(args: TestArgs) -> Result<()> {
             }
         }
 
-        // Doctests pass.
-        let body = format!("cargo test --doc{extra}");
+        // Doctests pass. `--quiet` collapses cargo's per-test
+        // chatter to one character per test; for the very common
+        // case of "lib target with zero ```rust fences" this turns
+        // a multi-line `Doc-tests <crate> / running 0 tests / test
+        // result: ok. 0 passed; …` block per crate into a single
+        // summary line per crate. Failures still print in full.
+        // We splice `--quiet` ahead of the user's args so that an
+        // explicit `-- --verbose` (or `-vv`) still wins via cargo's
+        // last-flag-wins convention.
+        let body = format!("cargo test --doc --quiet{extra}");
         let cmd = remote::build_remote_cmd(&ctx, &body);
         let doc_status =
             ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;

@@ -228,7 +228,13 @@ pub async fn rsync_to(
     remote_mkdir: Option<&str>,
 ) -> Result<()> {
     let mut cmd = Command::new("rsync");
-    cmd.arg("-az").arg("--delete").arg("--info=progress2");
+    // No `--info=progress2`: the progress line uses carriage-return
+    // updates that look fine on a real TTY but, when piped into an
+    // agent's tool-result, become a wall of partial-progress
+    // fragments. rsync defaults to silent on success and emits a
+    // useful diagnostic on failure, which is exactly what we want
+    // here.
+    cmd.arg("-az").arg("--delete");
     if let Some(path) = remote_mkdir {
         // The remote shell rsync's ssh transport spawns runs this in place
         // of `rsync`. The single-quoted path defends against unusual hashes
@@ -304,7 +310,7 @@ pub async fn rsync_from(
         // so only top-level files come through.
         cmd.arg("--exclude").arg("/*/");
     }
-    cmd.arg("-z").arg("--info=progress2");
+    cmd.arg("-z");
     cmd.arg("-e");
     let ssh_inner = {
         let mut s = String::from("ssh");
