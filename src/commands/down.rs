@@ -27,11 +27,14 @@ pub async fn run() -> Result<()> {
     // Re-read state under the lock and clear server_id. Only clear if it
     // still points at the server we just deleted — a concurrent build may
     // have re-provisioned in the gap, in which case we should leave the
-    // new server alone.
+    // new server alone. Also close out the audit-log session under
+    // the same lock so the lifetime/command-count is recorded with
+    // reason=down.
     config::update_state(|s| {
         if s.server_id == Some(id) {
             s.server_id = None;
         }
+        crate::audit::end_server_session(s, id, crate::audit::TerminationReason::Down);
         Ok(())
     })
     .await?;

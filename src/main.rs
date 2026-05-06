@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt};
 
+mod audit;
 mod commands;
 mod config;
 mod hcloud;
@@ -57,6 +58,10 @@ enum Command {
     Bench(commands::bench::BenchArgs),
     /// Show what's currently provisioned (server, volumes, current cost).
     Status,
+    /// Summarize the audit log: how many sessions, cold-vs-warm
+    /// command timings, and the wall-time split between provision /
+    /// sync / cargo. Useful for answering "is burst worth it?".
+    Audit(commands::audit::AuditArgs),
     /// Delete the running server now (volume is preserved).
     Down,
     /// Write usage instructions for cargo-burst into `~/.claude/CLAUDE.md`
@@ -113,6 +118,7 @@ async fn main() -> Result<()> {
         Command::Clippy(args) => commands::clippy::run(args).await,
         Command::Bench(args) => commands::bench::run(args).await,
         Command::Status => commands::status::run().await,
+        Command::Audit(args) => commands::audit::run(args).await,
         Command::Down => commands::down::run().await,
         Command::Install => commands::install::run().await,
         Command::ReapServer(args) => commands::reap::run_server(args).await,

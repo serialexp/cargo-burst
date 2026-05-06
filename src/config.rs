@@ -82,6 +82,31 @@ pub struct State {
     /// the workspace root path).
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectState>,
+    /// Session accounting for the currently-alive shared server. Set
+    /// when `ensure_shared_server` provisions a fresh box, incremented
+    /// per cargo phase, finalized into a `server_terminated` audit
+    /// event when the server is deleted. `None` between sessions.
+    /// Lives in `state.json` rather than memory because a single
+    /// session can span many cargo-burst invocations of the same
+    /// long-lived server.
+    #[serde(default)]
+    pub current_server_session: Option<ServerSession>,
+}
+
+/// In-flight accounting for a single server lifetime. Persisted to
+/// `state.json` so the count survives across cargo-burst invocations
+/// (the shared server outlives each individual `cargo burst <verb>`
+/// run). Finalized — and zeroed — when the server is destroyed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSession {
+    pub server_id: i64,
+    /// RFC3339 timestamp the server was provisioned at.
+    pub started_at: String,
+    /// Cumulative count of cargo phases that ran during this lifetime.
+    /// Bumped by `with_remote` after the closure returns (regardless
+    /// of success — a failed `cargo build` still consumed remote
+    /// resources).
+    pub command_count: u32,
 }
 
 impl State {
@@ -126,6 +151,12 @@ pub struct ProjectState {
     /// flow should not re-run.
     #[serde(default)]
     pub excludes: Option<Vec<String>>,
+    /// RFC3339 timestamp the current volume was provisioned at. Set
+    /// when `ensure_volume` creates a fresh volume, cleared when the
+    /// volume reaper destroys it. Used to compute volume lifetime in
+    /// the `volume_terminated` audit event.
+    #[serde(default)]
+    pub volume_started_at: Option<String>,
 }
 
 /// Resolve the per-user config directory, creating it on demand.

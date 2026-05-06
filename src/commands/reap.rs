@@ -120,12 +120,19 @@ pub async fn run_server(args: ReapServerArgs) -> Result<()> {
 
     // Clear server_id under the lock we already hold. We re-load to pick
     // up any concurrent state writes since our earlier read, and only
-    // clear if the state still points at the server we deleted.
+    // clear if the state still points at the server we deleted. While
+    // we have the lock we also close out the audit-log session for
+    // this server (lifetime, command count, reason=reap).
     let mut state = State::load()?;
     if state.server_id == Some(args.server_id) {
         state.server_id = None;
-        state.save().ok();
     }
+    crate::audit::end_server_session(
+        &mut state,
+        args.server_id,
+        crate::audit::TerminationReason::Reap,
+    );
+    state.save().ok();
     Ok(())
 }
 
@@ -244,13 +251,20 @@ pub async fn run_volume(args: ReapVolumeArgs) -> Result<()> {
 
     // Clear volume_id from per-project state. Re-load under the held lock
     // so we don't clobber concurrent writes; only clear if it still points
-    // at the volume we just deleted.
+    // at the volume we just deleted. Also close out the audit-log session
+    // for this volume (lifetime, reason=reap).
     let mut state = State::load()?;
     if let Some(p) = state.projects.get_mut(&args.project_hash) {
         if p.volume_id == Some(args.volume_id) {
             p.volume_id = None;
-            state.save().ok();
         }
+        crate::audit::end_volume_session(
+            p,
+            &args.project_hash,
+            args.volume_id,
+            crate::audit::TerminationReason::Reap,
+        );
+        state.save().ok();
     }
     Ok(())
 }

@@ -2,6 +2,7 @@
 //! flow for "what does `cargo burst build` actually do?" is locatable from
 //! one file.
 
+pub mod audit;
 pub mod bench;
 pub mod build;
 pub mod check;

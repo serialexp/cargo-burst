@@ -104,6 +104,12 @@ where
         "resolved cargo workspace"
     );
 
+    // Wall-time anchor for the audit log's `provision_secs` — we want
+    // to attribute "everything before cargo runs" to provisioning, so
+    // we start the timer at the very top of `with_remote` and stop it
+    // after `wait_for_ssh` returns (when the box is actually ready).
+    let provision_start = Instant::now();
+
     // Provisioning block: image check, ssh key, scan, volume, server,
     // attach. Held under the state lock so two concurrent burst commands
     // can't each spin up their own CCX63 (Hetzner happily creates two
@@ -111,7 +117,7 @@ where
     // stale in-memory state.
     let ssh_key_path = cfg.ssh_key_path()?;
     let pubkey = ssh::ensure_ssh_key(&ssh_key_path).await?;
-    let (server, volume, extra_excludes) = {
+    let (server, fresh_server, volume, fresh_volume, extra_excludes) = {
         let _lock = StateLock::acquire().await?;
         let mut state = State::load()?;
 
@@ -123,6 +129,7 @@ where
                 volume_id: None,
                 last_used_rfc3339: None,
                 excludes: None,
+                volume_started_at: None,
             });
 
         let image_id = state
@@ -137,8 +144,8 @@ where
         // us bail early if they Ctrl-C at the prompt.
         let extra_excludes = scan_and_confirm_excludes(&project, &mut state, opts.yes)?;
 
-        let volume = ensure_volume(&hcloud, &cfg, &project, &mut state).await?;
-        let server =
+        let (volume, fresh_volume) = ensure_volume(&hcloud, &cfg, &project, &mut state).await?;
+        let (server, fresh_server) =
             ensure_shared_server(&hcloud, &cfg, image_id, hetzner_key.id, &mut state).await?;
         let volume = ensure_volume_attached(&hcloud, volume, server.id).await?;
 
@@ -150,7 +157,7 @@ where
             p.last_used_rfc3339 = Some(now_rfc3339());
         }
         state.save()?;
-        (server, volume, extra_excludes)
+        (server, fresh_server, volume, fresh_volume, extra_excludes)
         // _lock drops here; concurrent runs can now provision.
     };
 
@@ -163,6 +170,10 @@ where
 
     // SSH wait first; everything below talks to the host.
     ssh::wait_for_ssh(&server_ip, "work", &ssh_key_path, SSH_WAIT_TIMEOUT).await?;
+    // Anything before this counted as "provisioning" — server + volume
+    // API calls, ssh-key sync, the local size scan, and the boot/SSH
+    // wait. Anything after counts as either sync or cargo time.
+    let provision_elapsed = provision_start.elapsed();
 
     // Spawn the heartbeat task for the rsync+cargo phase. Aborts on
     // drop, so even if `f` panics or `?`s out, the heartbeat is killed
@@ -201,7 +212,8 @@ where
     );
 
     tokio::try_join!(mount_fut, rsync_fut)?;
-    tracing::info!(elapsed = ?sync_start.elapsed(), "rsync + mount complete");
+    let sync_elapsed = sync_start.elapsed();
+    tracing::info!(elapsed = ?sync_elapsed, "rsync + mount complete");
 
     // Hand the prepared environment off to the caller. They run
     // whatever cargo subcommand makes sense; we just measure how long
@@ -230,11 +242,36 @@ where
     // healthy reaper schedule and a recorded last_used.
     heartbeat.shutdown().await;
 
+    // Bump last_used + record this command in the audit log + bump
+    // the session counter, all under one state-lock acquisition.
+    // `label` is already canonical ("Build", "Tests", "Check",
+    // "Clippy", "Bench") so we just lowercase + collapse "tests" →
+    // "test" to match cargo's own verb spelling.
     let hash_for_final = project.hash.clone();
+    let server_id_for_audit = server.id;
+    let verb = label_to_verb(label);
+    let success = cargo_result.is_ok();
+    let provision_secs = provision_elapsed.as_secs_f64();
+    let sync_secs = sync_elapsed.as_secs_f64();
+    let cargo_secs = cargo_elapsed.as_secs_f64();
     if let Err(e) = config::update_state(move |s| {
         if let Some(p) = s.projects.get_mut(&hash_for_final) {
             p.last_used_rfc3339 = Some(now_rfc3339());
         }
+        crate::audit::record_command(
+            s,
+            &crate::audit::CommandSample {
+                server_id: server_id_for_audit,
+                project_hash: &hash_for_final,
+                verb: &verb,
+                success,
+                provision_secs,
+                sync_secs,
+                cargo_secs,
+                fresh_server,
+                fresh_volume,
+            },
+        );
         Ok(())
     })
     .await
@@ -330,14 +367,18 @@ async fn ensure_volume(
     cfg: &Config,
     project: &ProjectKey,
     state: &mut State,
-) -> Result<Volume> {
+) -> Result<(Volume, bool)> {
     let p = state.projects.get_mut(&project.hash).expect("inserted earlier");
 
     if let Some(id) = p.volume_id {
         match hcloud.get_volume(id).await {
-            Ok(v) => return Ok(v),
+            Ok(v) => return Ok((v, false)),
             Err(e) => {
                 tracing::warn!("volume {id} from state.json not found ({e}); will recreate");
+                // Volume vanished server-side; close out the lifetime
+                // ledger before the upcoming `begin_volume_session`
+                // would emit an `orphaned` for it anyway.
+                crate::audit::end_volume_session(p, &project.hash, id, crate::audit::TerminationReason::Stale);
                 p.volume_id = None;
             }
         }
@@ -345,7 +386,7 @@ async fn ensure_volume(
     if let Some(v) = hcloud.find_volume(&project.volume_name()).await? {
         tracing::info!(id = v.id, "found existing volume by name");
         p.volume_id = Some(v.id);
-        return Ok(v);
+        return Ok((v, false));
     }
 
     tracing::info!(
@@ -373,7 +414,14 @@ async fn ensure_volume(
         hcloud.wait_action(action.id, Duration::from_secs(120)).await?;
     }
     p.volume_id = Some(resp.volume.id);
-    Ok(resp.volume)
+    crate::audit::begin_volume_session(
+        p,
+        &project.hash,
+        resp.volume.id,
+        cfg.volume_gb,
+        &cfg.region,
+    );
+    Ok((resp.volume, true))
 }
 
 async fn ensure_shared_server(
@@ -382,20 +430,24 @@ async fn ensure_shared_server(
     image_id: i64,
     ssh_key_id: i64,
     state: &mut State,
-) -> Result<Server> {
+) -> Result<(Server, bool)> {
     if let Some(id) = state.server_id {
         match hcloud.get_server(id).await {
             Ok(s) if matches!(s.status.as_str(), "running" | "starting" | "initializing") => {
                 tracing::info!(id, status = %s.status, "reusing shared server from state");
-                return Ok(s);
+                return Ok((s, false));
             }
             Ok(s) => {
                 tracing::warn!(id, status = %s.status, "stale server in state; deleting");
                 let _ = hcloud.delete_server(id).await;
+                crate::audit::end_server_session(state, id, crate::audit::TerminationReason::Stale);
                 state.server_id = None;
             }
             Err(e) => {
                 tracing::warn!("server {id} from state.json not found ({e}); will recreate");
+                // Server vanished server-side. Close the lifetime
+                // ledger so the next provision starts a fresh session.
+                crate::audit::end_server_session(state, id, crate::audit::TerminationReason::Stale);
                 state.server_id = None;
             }
         }
@@ -405,10 +457,11 @@ async fn ensure_shared_server(
         if matches!(s.status.as_str(), "running" | "starting" | "initializing") {
             tracing::info!(id = s.id, status = %s.status, "found shared server by name");
             state.server_id = Some(s.id);
-            return Ok(s);
+            return Ok((s, false));
         }
         tracing::warn!(id = s.id, status = %s.status, "deleting stale server found by name");
         let _ = hcloud.delete_server(s.id).await;
+        crate::audit::end_server_session(state, s.id, crate::audit::TerminationReason::Stale);
     }
 
     tracing::info!(
@@ -441,7 +494,14 @@ async fn ensure_shared_server(
 
     let server = hcloud.get_server(create.server.id).await?;
     state.server_id = Some(server.id);
-    Ok(server)
+    crate::audit::begin_server_session(
+        state,
+        server.id,
+        &cfg.server_type,
+        image_id,
+        &cfg.region,
+    );
+    Ok((server, true))
 }
 
 async fn ensure_volume_attached(
@@ -752,4 +812,35 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
         sccache = ctx.sccache_dir,
         src = ctx.remote_src,
     )
+}
+
+/// Map the human-readable label that subcommands pass into `with_remote`
+/// (`"Build"`, `"Tests"`, `"Check"`, `"Clippy"`, `"Bench"`) to a
+/// canonical lowercase cargo verb for the audit log.
+///
+/// Only "Tests" needs a special case — we record `"test"` to match
+/// cargo's own verb name. Anything else just lowercases.
+fn label_to_verb(label: &str) -> String {
+    match label.to_ascii_lowercase().as_str() {
+        "tests" => "test".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_to_verb_canonicalizes_test() {
+        assert_eq!(label_to_verb("Tests"), "test");
+    }
+
+    #[test]
+    fn label_to_verb_lowercases_others() {
+        assert_eq!(label_to_verb("Build"), "build");
+        assert_eq!(label_to_verb("Check"), "check");
+        assert_eq!(label_to_verb("Clippy"), "clippy");
+        assert_eq!(label_to_verb("Bench"), "bench");
+    }
 }
