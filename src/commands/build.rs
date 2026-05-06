@@ -76,20 +76,45 @@ pub async fn run(args: BuildArgs) -> Result<()> {
         }
 
         let profile_dir = cargo_profile_dir(&cargo_args);
-        let remote_artifacts = format!("{}/{profile_dir}/", ctx.target_dir);
-        let local_artifacts = ctx.workspace_root.join("target").join(&profile_dir);
-        std::fs::create_dir_all(&local_artifacts)
-            .map_err(|e| anyhow!("creating {}: {e}", local_artifacts.display()))?;
+        let triples = cargo_target_triples(&cargo_args);
+
+        // Compose the list of (remote, local) artifact directories to
+        // fetch. Cargo's layout:
+        //   - no `--target`: artifacts at `target/<profile>/`
+        //   - one or more `--target X`: artifacts at `target/<X>/<profile>/`
+        //     for each X, and *nothing* at the bare `target/<profile>/`.
+        // Mirror that exactly so a multi-target invocation pulls every
+        // artifact set back to the equivalent local subdir.
+        let fetches: Vec<(String, std::path::PathBuf)> = if triples.is_empty() {
+            vec![(
+                format!("{}/{profile_dir}/", ctx.target_dir),
+                ctx.workspace_root.join("target").join(&profile_dir),
+            )]
+        } else {
+            triples
+                .iter()
+                .map(|t| {
+                    (
+                        format!("{}/{t}/{profile_dir}/", ctx.target_dir),
+                        ctx.workspace_root
+                            .join("target")
+                            .join(t)
+                            .join(&profile_dir),
+                    )
+                })
+                .collect()
+        };
 
         // Hetzner's CCX boxes are linux x86_64. If the local machine
-        // doesn't match, the fetched binary is built for an arch the
-        // local OS can't execute — fine if you're cross-compiling for
-        // deployment to a linux amd64 host, but surprising otherwise.
-        // Warn rather than skip: the user might genuinely want the
-        // binary for ssh/scp onwards.
+        // doesn't match AND the user didn't explicitly cross-compile
+        // (i.e. no `--target`), the fetched binary is built for an arch
+        // the local OS can't execute. Warn rather than skip: the user
+        // might genuinely want the binary for ssh/scp onwards. When
+        // `--target` is explicit the user already knows they're cross-
+        // compiling for deployment, so the warning would just be noise.
         let host_os = std::env::consts::OS;
         let host_arch = std::env::consts::ARCH;
-        if host_os != "linux" || host_arch != "x86_64" {
+        if triples.is_empty() && (host_os != "linux" || host_arch != "x86_64") {
             tracing::warn!(
                 local = %format!("{host_os}-{host_arch}"),
                 remote = "linux-x86_64",
@@ -99,25 +124,29 @@ pub async fn run(args: BuildArgs) -> Result<()> {
             );
         }
 
-        tracing::info!(
-            from = %remote_artifacts,
-            to = %local_artifacts.display(),
-            "fetching top-level artifacts"
-        );
-        // top_level_only=true: skip deps/, build/, incremental/,
-        // .fingerprint/ etc. Local cargo will rebuild those on its next
-        // invocation regardless — pulling them back would just waste
-        // bandwidth and disk. The binary you actually want lives at the
-        // top level alongside .so/.dylib outputs.
-        ssh::rsync_from(
-            &ctx.server_ip,
-            "work",
-            &ctx.ssh_key_path,
-            &remote_artifacts,
-            &local_artifacts,
-            true,
-        )
-        .await?;
+        for (remote_artifacts, local_artifacts) in &fetches {
+            std::fs::create_dir_all(local_artifacts)
+                .map_err(|e| anyhow!("creating {}: {e}", local_artifacts.display()))?;
+            tracing::info!(
+                from = %remote_artifacts,
+                to = %local_artifacts.display(),
+                "fetching top-level artifacts"
+            );
+            // top_level_only=true: skip deps/, build/, incremental/,
+            // .fingerprint/ etc. Local cargo will rebuild those on its next
+            // invocation regardless — pulling them back would just waste
+            // bandwidth and disk. The binary you actually want lives at the
+            // top level alongside .so/.dylib outputs.
+            ssh::rsync_from(
+                &ctx.server_ip,
+                "work",
+                &ctx.ssh_key_path,
+                remote_artifacts,
+                local_artifacts,
+                true,
+            )
+            .await?;
+        }
         Ok(())
     })
     .await
@@ -160,5 +189,108 @@ fn profile_to_dir(profile: &str) -> &str {
         "dev" | "test" => "debug",
         // Custom profile — cargo uses the profile name as the dir.
         custom => custom,
+    }
+}
+
+/// Extract every `--target <triple>` / `--target=<triple>` value from
+/// the cargo args, in argv order, deduplicated (cargo itself ignores
+/// duplicate `--target` values, so we mirror that — fetching the same
+/// directory twice would be a waste).
+///
+/// When this returns an empty Vec, cargo writes artifacts to
+/// `target/<profile>/`. When it returns one or more triples, cargo
+/// writes artifacts to `target/<triple>/<profile>/` for each triple
+/// and *nothing* to the bare `target/<profile>/`.
+fn cargo_target_triples(args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        let triple = if a == "--target" {
+            iter.next().map(String::as_str)
+        } else {
+            a.strip_prefix("--target=")
+        };
+        if let Some(t) = triple {
+            if !t.is_empty() && !out.iter().any(|existing| existing == t) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn no_target_returns_empty() {
+        assert!(cargo_target_triples(&s(&["build", "--release"])).is_empty());
+    }
+
+    #[test]
+    fn space_form_single() {
+        assert_eq!(
+            cargo_target_triples(&s(&["build", "--target", "aarch64-unknown-linux-gnu"])),
+            vec!["aarch64-unknown-linux-gnu".to_string()]
+        );
+    }
+
+    #[test]
+    fn equals_form_single() {
+        assert_eq!(
+            cargo_target_triples(&s(&["build", "--target=x86_64-unknown-linux-musl"])),
+            vec!["x86_64-unknown-linux-musl".to_string()]
+        );
+    }
+
+    #[test]
+    fn multiple_targets_preserve_order() {
+        assert_eq!(
+            cargo_target_triples(&s(&[
+                "build",
+                "--release",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--target=x86_64-unknown-linux-musl",
+            ])),
+            vec![
+                "aarch64-unknown-linux-gnu".to_string(),
+                "x86_64-unknown-linux-musl".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_targets_collapsed() {
+        assert_eq!(
+            cargo_target_triples(&s(&[
+                "build",
+                "--target",
+                "aarch64-unknown-linux-gnu",
+                "--target=aarch64-unknown-linux-gnu",
+            ])),
+            vec!["aarch64-unknown-linux-gnu".to_string()]
+        );
+    }
+
+    #[test]
+    fn dangling_target_flag_is_ignored() {
+        // `--target` with no value — malformed; cargo would error, we
+        // just skip it rather than panic.
+        assert!(cargo_target_triples(&s(&["build", "--target"])).is_empty());
+    }
+
+    #[test]
+    fn target_dir_flag_is_not_a_target() {
+        // `--target-dir` shares a prefix; make sure we don't accidentally
+        // treat it (or any other future `--target<something>` flag) as
+        // an arch triple.
+        assert!(cargo_target_triples(&s(&["build", "--target-dir", "/tmp/x"])).is_empty());
+        assert!(cargo_target_triples(&s(&["build", "--target-dir=/tmp/x"])).is_empty());
     }
 }
