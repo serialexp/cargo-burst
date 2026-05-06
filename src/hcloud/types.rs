@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Deserialize)]
 pub struct SshKey {
     pub id: i64,
-    pub name: String,
-    pub fingerprint: String,
     pub public_key: String,
 }
 
@@ -38,11 +36,9 @@ pub(super) struct CreateSshKeyRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Server {
     pub id: i64,
-    pub name: String,
     pub status: String,
     pub public_net: PublicNet,
     pub server_type: ServerType,
-    pub created: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,9 +54,6 @@ pub struct Ipv4 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerType {
     pub name: String,
-    pub cores: u32,
-    pub memory: f64,
-    pub disk: u32,
 }
 
 #[derive(Serialize, Debug)]
@@ -97,10 +90,6 @@ pub enum ImageRef {
 pub struct CreateServerResponse {
     pub server: Server,
     pub action: Action,
-    /// Hetzner returns a one-time root password unless we use SSH keys.
-    /// We always pass SSH keys so this should always be `None`.
-    #[serde(default)]
-    pub root_password: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -113,22 +102,11 @@ pub(super) struct ServersResponse { pub servers: Vec<Server> }
 #[derive(Debug, Clone, Deserialize)]
 pub struct Volume {
     pub id: i64,
-    pub name: String,
     pub size: u32,
     pub status: String,
     /// Server ID this volume is currently attached to, if any.
     #[serde(default)]
     pub server: Option<i64>,
-    /// Linux device path the volume appears at when attached
-    /// (e.g. `/dev/disk/by-id/scsi-0HC_Volume_<id>`).
-    pub linux_device: String,
-    pub location: Location,
-    pub created: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Location {
-    pub name: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -168,12 +146,8 @@ pub(super) struct VolumesResponse { pub volumes: Vec<Volume> }
 pub struct Image {
     pub id: i64,
     pub status: String,
-    #[serde(rename = "type")]
-    pub type_: String,
     #[serde(default)]
     pub description: Option<String>,
-    #[serde(default)]
-    pub created: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -195,6 +169,11 @@ pub struct Action {
     pub error: Option<ActionError>,
 }
 
+/// Surfaced via `Debug` in the action-failure error message in
+/// `wait_action` (see `hcloud/mod.rs`). The fields are not read
+/// directly anywhere, but losing them would silently strip the
+/// human-readable reason out of every Hetzner action failure.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ActionError {
     pub code: String,

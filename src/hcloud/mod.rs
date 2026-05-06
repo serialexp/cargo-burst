@@ -171,13 +171,6 @@ impl HCloud {
         Ok(resp.image)
     }
 
-    pub async fn delete_image(&self, id: i64) -> Result<()> {
-        let _: serde_json::Value = self
-            .request::<(), _>(Method::DELETE, &format!("/images/{id}"), None)
-            .await?;
-        Ok(())
-    }
-
     // ── Volumes ─────────────────────────────────────────────────────────
 
     pub async fn create_volume(&self, req: CreateVolumeRequest) -> Result<CreateVolumeResponse> {
