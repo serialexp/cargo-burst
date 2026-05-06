@@ -241,12 +241,17 @@ pub async fn rsync_from(
     top_level_only: bool,
 ) -> Result<()> {
     let mut cmd = Command::new("rsync");
+    cmd.arg("-a");
     if top_level_only {
-        // -a includes -r; --no-r negates just the recursion. Subdirs in
-        // src are silently skipped (not even created in dest).
-        cmd.arg("-a").arg("--no-r");
-    } else {
-        cmd.arg("-a");
+        // We want top-level *files* in src/ but none of its subdirs
+        // (deps/, build/, .fingerprint/ etc. for a cargo target dir).
+        // The naive `--no-r` combo with `-a` is a footgun: rsync prints
+        // "skipping directory ." and transfers nothing, because without
+        // recursion it refuses to enter the source dir at all.
+        // `--exclude='/*/'` is the right idiom: keep -r on, but match
+        // (and skip) every directory entry directly under the src root,
+        // so only top-level files come through.
+        cmd.arg("--exclude").arg("/*/");
     }
     cmd.arg("-z").arg("--info=progress2");
     cmd.arg("-e");
