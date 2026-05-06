@@ -65,6 +65,7 @@ cargo burst bench                  # criterion HTML reports rsynced back
 | `cargo burst clippy [args]`  | `cargo clippy [args]`                    | nothing                                       |
 | `cargo burst bench [args]`   | `cargo bench [args]`                     | `target/criterion/` (recursive, if present)   |
 | `cargo burst status`         | —                                        | shows what's provisioned + last-used per project |
+| `cargo burst audit`          | —                                        | summarises the lifecycle log (sessions, cold-vs-warm timings, wall-time split, per-verb means; pass `--rate EUR_PER_HOUR` for cost) |
 | `cargo burst down`           | deletes the running server               | (volume kept until volume reaper fires)       |
 | `cargo burst image build`    | bakes a fresh base image                 | —                                             |
 
@@ -105,10 +106,14 @@ Common flags on every run-subcommand:
 
 ## Cost (rough)
 
-- CCX63 (48 dedicated cores, 192 GB) at €0.31/hr running cost.
-- 30 min of usage per day → ~€5/mo runtime + ~€9/mo for one 200 GB volume.
-- ~€14/mo total for a 4× core uplift over a 12-core local machine
-  with no thermal throttling.
+- CCX63 (48 dedicated cores, 192 GB) at €0.5201/hr in hel1/fsn1
+  (€374.49/mo cap = hourly × 720). Singapore is €0.871/hr.
+- 30 min of usage per day → ~€8/mo runtime + ~€9/mo for one 200 GB
+  volume → ~€17/mo total for a 4× core uplift over a 12-core local
+  machine with no thermal throttling.
+- Reach for `cargo burst audit --rate 0.5201` after a few sessions
+  to see actual cost-so-far against your real usage instead of the
+  back-of-envelope number above.
 - Volume reaper means inactive projects stop costing volume rent after
   `volume_keep_alive_secs` (default 1h); the next build re-creates the
   volume from scratch (~30s for the cargo fresh-build penalty).
