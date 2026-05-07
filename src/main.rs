@@ -44,6 +44,18 @@ enum Command {
     /// Defaults to `cargo nextest run` followed by `cargo test --doc`
     /// (matching `cargo test`'s coverage but exploiting nextest's
     /// per-process parallelism on the CCX63's 48 cores).
+    ///
+    /// Database services available on the remote (localhost-only,
+    /// started on every cold boot; the test runner blocks until all
+    /// three ports are reachable):
+    ///
+    ///   postgres://postgres@localhost:5432/postgres   (no password, trust auth)
+    ///   mysql://root:root@localhost:3306/
+    ///   redis://localhost:6379/
+    ///
+    /// DB data lives on the server's root disk, not the per-project
+    /// volume — every cold-booted server starts with empty databases.
+    #[command(verbatim_doc_comment)]
     Test(commands::test::TestArgs),
     /// Run `cargo check` on the remote server. Pure passthrough — no
     /// artifact fetch, output streams back over SSH.
@@ -55,6 +67,15 @@ enum Command {
     /// makes bench numbers comparable across runs. By default the
     /// criterion HTML report dir (if present) is rsynced back into
     /// the local `target/criterion/` after the run.
+    ///
+    /// Database services available on the remote (same as `test`,
+    /// localhost-only, started on every cold boot; the bench runner
+    /// blocks until all three ports are reachable):
+    ///
+    ///   postgres://postgres@localhost:5432/postgres   (no password, trust auth)
+    ///   mysql://root:root@localhost:3306/
+    ///   redis://localhost:6379/
+    #[command(verbatim_doc_comment)]
     Bench(commands::bench::BenchArgs),
     /// Show what's currently provisioned (server, volumes, current cost).
     Status,
