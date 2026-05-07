@@ -976,11 +976,7 @@ pub async fn run_cargo_passthrough(
     default_verb: &'static str,
     cargo_args: Vec<String>,
 ) -> Result<()> {
-    let cargo_args = if cargo_args.is_empty() {
-        vec![default_verb.to_string()]
-    } else {
-        cargo_args
-    };
+    let cargo_args = prepend_cargo_verb(default_verb, cargo_args);
     with_remote(opts, label, move |ctx: RemoteCtx| async move {
         let escaped: Vec<String> = cargo_args.iter().map(|a| shell_escape(a)).collect();
         let cmd = build_remote_cmd(&ctx, &format!("cargo {}", escaped.join(" ")));
@@ -1026,6 +1022,31 @@ fn label_to_verb(label: &str) -> String {
         "tests" => "test".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Ensure `cargo_args` starts with the cargo subcommand verb that the
+/// user invoked (`build`/`check`/`clippy`/…). Args passed after `--`
+/// from the CLI are flags for that verb, not a replacement of it —
+/// `cargo burst check -- --all-targets` should run `cargo check
+/// --all-targets`, not `cargo --all-targets`.
+///
+/// If the user already started their args with the verb (legacy
+/// habit, e.g. `cargo burst build -- build --release`), we leave
+/// it alone — prepending again would produce `cargo build build
+/// --release`, which fails.
+pub fn prepend_cargo_verb(verb: &str, args: Vec<String>) -> Vec<String> {
+    let already_has_verb = args
+        .iter()
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-'))
+        == Some(verb);
+    if already_has_verb {
+        return args;
+    }
+    let mut out = Vec::with_capacity(args.len() + 1);
+    out.push(verb.to_string());
+    out.extend(args);
+    out
 }
 
 #[cfg(test)]
@@ -1109,6 +1130,48 @@ mod tests {
              \"message\":\"error during placement\",\"details\":{{}}}}}}"
         );
         assert!(is_capacity_error(&e));
+    }
+
+    #[test]
+    fn prepend_verb_when_user_passes_only_flags() {
+        // `cargo burst check -- --all-targets` → cargo_args = ["--all-targets"]
+        // Without the prepend, the body would become `cargo --all-targets`
+        // and cargo would reject it.
+        let out = prepend_cargo_verb("check", vec!["--all-targets".into()]);
+        assert_eq!(out, vec!["check", "--all-targets"]);
+    }
+
+    #[test]
+    fn prepend_verb_on_empty_args() {
+        // `cargo burst check` (no `--` segment) should still run `cargo check`.
+        assert_eq!(prepend_cargo_verb("check", vec![]), vec!["check"]);
+    }
+
+    #[test]
+    fn prepend_verb_skips_when_user_already_typed_it() {
+        // Legacy habit: `cargo burst build -- build --release`. Don't
+        // double it up.
+        let out = prepend_cargo_verb(
+            "build",
+            vec!["build".into(), "--release".into()],
+        );
+        assert_eq!(out, vec!["build", "--release"]);
+    }
+
+    #[test]
+    fn prepend_verb_handles_leading_flags_then_different_verb() {
+        // Cargo's own `+toolchain` style isn't supported here, but if
+        // someone types `cargo burst clippy -- --all-targets check`,
+        // the first non-flag token is `check`, which doesn't match
+        // `clippy` — so we still prepend, producing
+        // `cargo clippy --all-targets check`. Cargo will then complain
+        // about the extra positional. That's fine — better than us
+        // silently accepting nonsense.
+        let out = prepend_cargo_verb(
+            "clippy",
+            vec!["--all-targets".into(), "check".into()],
+        );
+        assert_eq!(out, vec!["clippy", "--all-targets", "check"]);
     }
 
     #[test]

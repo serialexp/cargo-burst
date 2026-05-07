@@ -40,11 +40,10 @@ pub struct BuildArgs {
 }
 
 pub async fn run(args: BuildArgs) -> Result<()> {
-    let cargo_args = if args.cargo_args.is_empty() {
-        vec!["build".to_string()]
-    } else {
-        args.cargo_args.clone()
-    };
+    // Args after `--` are forwarded as cargo flags. The verb (`build`)
+    // is always implicit, so we splice it in front unless the user
+    // already typed it.
+    let cargo_args = remote::prepend_cargo_verb("build", args.cargo_args.clone());
 
     let opts = RemoteOptions {
         keep_alive: args.keep_alive,
