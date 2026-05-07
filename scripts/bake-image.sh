@@ -215,10 +215,23 @@ chown work:work /home/work/.ssh/authorized_keys
 
 # Rust toolchain: stable, minimal profile (no docs/source). rustup lives
 # in /home/work/.rustup; cargo bins land in /home/work/.cargo/bin.
+#
+# `--profile minimal` gives rustc + rust-std + cargo only — clippy and
+# rustfmt are *components*, not part of the minimal toolchain. We add
+# them explicitly because:
+#   - `cargo burst clippy` obviously needs clippy.
+#   - `cargo burst test`/`cargo burst build` projects frequently run
+#     `cargo fmt --check` from CI scripts or from a custom test
+#     harness; missing rustfmt would be a confusing failure mode.
+# Adding both up front (one extra ~30s on bake, ~10 MB on the image)
+# is cheaper than the support load of "I keep getting `not installed
+# for the toolchain` errors".
 sudo -iu work bash <<'EOFINNER'
 set -euo pipefail
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
+source ~/.cargo/env
+rustup component add clippy rustfmt
 cat > ~/.cargo/config.toml <<'TOML'
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"

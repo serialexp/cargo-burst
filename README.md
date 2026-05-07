@@ -175,8 +175,9 @@ and isn't supported today.
 ## How it works
 
 1. **Image** — A single Hetzner snapshot baked once with Ubuntu 24.04 +
-   rustup stable + mold + sccache + cargo-nextest + git + rsync + a `work`
-   user authorized with your local SSH public key. Rebuild only when you
+   rustup stable (with `clippy` and `rustfmt` components) + mold + sccache +
+   cargo-nextest + git + rsync + postgres/mysql/redis + a `work` user
+   authorized with your local SSH public key. Rebuild only when you
    want a newer toolchain.
 2. **Volume** — One Hetzner volume per cargo project (keyed on the
    absolute path of the workspace). Holds `CARGO_TARGET_DIR` and the
