@@ -80,7 +80,10 @@ pub async fn run(args: TestArgs) -> Result<()> {
         if use_cargo_test {
             // Single shot: vanilla cargo test (covers unit + integration
             // + doctests, like the user expects from a bare `cargo test`).
-            let body = format!("cargo test{extra}");
+            // Wait-for-DB up front: integration tests that hit
+            // postgres/mysql/redis would otherwise race service startup
+            // on a freshly-cold-booted server.
+            let body = format!("{}cargo test{extra}", remote::DB_WAIT_PREFIX);
             let cmd = remote::build_remote_cmd(&ctx, &body);
             let status = ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
             if !status.success() {
@@ -90,7 +93,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
         }
 
         // Default path: nextest first.
-        let body = format!("cargo nextest run{extra}");
+        let body = format!("{}cargo nextest run{extra}", remote::DB_WAIT_PREFIX);
         let cmd = remote::build_remote_cmd(&ctx, &body);
         let nextest_status =
             ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;

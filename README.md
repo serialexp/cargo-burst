@@ -90,6 +90,32 @@ Common flags on every run-subcommand:
 - `--no-fetch` — skip artifact fetch (build, bench)
 - `--yes` — skip the first-run "apply suggested rsync excludes?" prompt
 
+## Database services for integration tests
+
+The base image ships with `postgres`, `mysql`, and `redis` installed,
+configured for predictable localhost-only access, and started via
+systemd on every cold boot. `cargo burst test` and `cargo burst
+bench` block until all three ports are reachable before invoking
+cargo, so integration tests don't race service startup.
+
+| Service  | Connection string                                    |
+|----------|------------------------------------------------------|
+| Postgres | `postgres://postgres@localhost:5432/postgres` (no password) |
+| MySQL    | `mysql://root:root@localhost:3306/`                  |
+| Redis    | `redis://localhost:6379/`                            |
+
+All three bind to `127.0.0.1` only — nothing is reachable from the
+public internet. Trust auth on Postgres is intentional and only safe
+because the image is used exclusively for ephemeral per-user build VMs.
+
+**Data lifecycle.** DB data lives on the server's root disk, not on
+the per-project volume. That means every cold-booted server starts
+with empty databases; within one server lifetime, state survives
+across `cargo burst test` runs. This matches typical integration-test
+patterns (each test creates its own DB or wraps in a transaction).
+Persistent DB state across reaps would require a different design
+and isn't supported today.
+
 ## How it works
 
 1. **Image** — A single Hetzner snapshot baked once with Ubuntu 24.04 +

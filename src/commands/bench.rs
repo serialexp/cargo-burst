@@ -66,7 +66,7 @@ pub async fn run(args: BenchArgs) -> Result<()> {
         } else {
             format!(" {}", escaped.join(" "))
         };
-        let body = format!("cargo bench{extra}");
+        let body = format!("{}cargo bench{extra}", remote::DB_WAIT_PREFIX);
         let cmd = remote::build_remote_cmd(&ctx, &body);
         let status = ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
         if !status.success() {

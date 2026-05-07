@@ -89,6 +89,118 @@ apt-get install -y --no-install-recommends \
     build-essential clang lld curl git rsync ca-certificates pkg-config \
     libssl-dev mold xz-utils
 
+# ── Database services for integration tests ────────────────────────────
+#
+# Tests that need a real Postgres / MySQL / Redis can hit them on
+# localhost on the standard ports. All three bind to 127.0.0.1 only —
+# nothing here is exposed to the public internet.
+#
+# Connection strings (matching the conventions most test fixtures
+# expect; documented in README.md too):
+#
+#   postgres://postgres@localhost:5432/postgres   (no password)
+#   mysql://root:root@localhost:3306/
+#   redis://localhost:6379/
+#
+# Data persistence: the data dirs live on the server's root disk, so
+# every cold-boot server (after a reap) starts with empty databases.
+# Within one server lifetime, DB state survives across `cargo burst
+# test` runs. This matches typical integration-test patterns where
+# each test creates its own DB or wraps in a transaction. Bart's
+# per-project volumes hold target/ + sccache only — DB data does NOT
+# follow the volume across reaps.
+echo "[cargo-burst] installing database services"
+apt-get install -y --no-install-recommends \
+    postgresql postgresql-contrib \
+    mysql-server \
+    redis-server
+
+# ── Postgres ──
+#
+# Default Ubuntu install creates a `postgres` superuser bound to
+# OS-level peer auth on the local socket. We replace pg_hba.conf
+# entirely with a config that:
+#   - keeps peer auth for the `postgres` OS user (so `sudo -u
+#     postgres psql` keeps working for image-build debugging)
+#   - trusts every TCP connection from 127.0.0.1 (so test fixtures
+#     can connect with no password)
+#
+# Trust auth on a localhost-only-bound port is fine for ephemeral
+# build VMs that aren't reachable from outside. It would NOT be fine
+# on a long-running multi-tenant box.
+PG_VERSION="$(ls /etc/postgresql | sort -V | tail -n1)"
+PG_CONF_DIR="/etc/postgresql/${PG_VERSION}/main"
+echo "[cargo-burst] configuring postgres ${PG_VERSION} for trust auth on localhost"
+cat > "${PG_CONF_DIR}/pg_hba.conf" <<'PGHBA'
+# Written by cargo-burst bake. localhost trust is intentional — the
+# image is only used for short-lived per-user build VMs that bind
+# postgres to 127.0.0.1.
+local   all             postgres                                peer
+local   all             all                                     peer
+host    all             all             127.0.0.1/32            trust
+host    all             all             ::1/128                 trust
+PGHBA
+chown postgres:postgres "${PG_CONF_DIR}/pg_hba.conf"
+chmod 0640 "${PG_CONF_DIR}/pg_hba.conf"
+systemctl enable postgresql
+
+# ── MySQL ──
+#
+# Ubuntu's default mysql-server install creates a `root@localhost`
+# user with `auth_socket` plugin (only the OS root user can connect,
+# no password). Test fixtures expect a usable password. Switch to
+# `caching_sha2_password` and set root/root.
+#
+# We need mysqld running to ALTER USER, then stop it cleanly so the
+# datadir is in a quiescent state for the snapshot.
+echo "[cargo-burst] configuring mysql with root/root credentials"
+systemctl start mysql
+mysql --user=root <<'MYSQL'
+ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY 'root';
+FLUSH PRIVILEGES;
+MYSQL
+systemctl stop mysql
+systemctl enable mysql
+
+# ── Redis ──
+#
+# Stock /etc/redis/redis.conf already binds to 127.0.0.1 with no auth.
+# Just enable the unit; nothing to tweak.
+echo "[cargo-burst] enabling redis"
+systemctl enable redis-server
+
+# Helper script: block until each DB port is accepting connections, or
+# 30s elapsed, or the service obviously isn't running. cargo-burst
+# subcommands that need DBs (`test`, `bench`) call this before invoking
+# cargo, so the first integration test on a freshly-booted server
+# doesn't race postgres/mysql startup. On warm runs every port is
+# already up, so the loop returns in ~5 ms.
+install -d -m 0755 /usr/local/bin
+cat > /usr/local/bin/cargo-burst-wait-for-databases <<'WAIT'
+#!/bin/bash
+# Wait for postgres / mysql / redis to be reachable on localhost.
+# Runs at the top of `cargo burst test` and `cargo burst bench`.
+# Exits 0 when all three are reachable; warns and exits 0 on timeout
+# (the user's code might not need every service — let it fail with
+# a real error rather than us masking it).
+set -u
+deadline=$(( $(date +%s) + 30 ))
+ports=(5432 3306 6379)
+for port in "${ports[@]}"; do
+    while true; do
+        if (echo > /dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+            break
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "warn: port $port not reachable within 30s; continuing anyway" >&2
+            break
+        fi
+        sleep 0.2
+    done
+done
+WAIT
+chmod 0755 /usr/local/bin/cargo-burst-wait-for-databases
+
 # Dedicated build user. Sudo is allowed but not used by the build flow —
 # it's there to make manual debugging via `cargo burst shell` painless.
 useradd -m -s /bin/bash -G sudo work

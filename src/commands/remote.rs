@@ -989,6 +989,21 @@ pub async fn run_cargo_passthrough(
     .await
 }
 
+/// Shell prefix that blocks until postgres/mysql/redis are reachable
+/// on the remote, or 30 s, whichever comes first.
+///
+/// Used by `cargo burst test` and `cargo burst bench`, which are the
+/// subcommands likely to want a real database. Idempotent and ~5 ms
+/// once the services are warm.
+///
+/// The `command -v … || true` wrapper degrades gracefully when the
+/// remote image is older than v0.4.0 (no `cargo-burst-wait-for-
+/// databases` script baked in) — the user just doesn't get the wait,
+/// matching pre-v0.4 behaviour. They can rebake to opt in.
+pub const DB_WAIT_PREFIX: &str =
+    "(command -v cargo-burst-wait-for-databases >/dev/null \
+     && cargo-burst-wait-for-databases || true) && ";
+
 /// Render the boilerplate that wraps every cargo invocation: pin
 /// `CARGO_TARGET_DIR` and `SCCACHE_DIR` to the project's volume slot,
 /// put `~/.cargo/bin` on PATH (so `cargo-nextest` is reachable), make
