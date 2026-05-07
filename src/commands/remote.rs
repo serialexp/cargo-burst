@@ -594,10 +594,15 @@ async fn ensure_shared_server(
             .map(|d| d.location.name.clone())
             .unwrap_or_else(|| fallback.to_string())
     }
+    // Fallback only if Hetzner returns a Server without `datacenter`
+    // (we haven't observed this in practice, but the field is `Option`).
+    // `attempt_regions` is non-empty in every reachable code path —
+    // the empty case errors out below — so `.first()` is effectively
+    // infallible here.
     let region_fallback: &str = attempt_regions
         .first()
         .map(String::as_str)
-        .unwrap_or(&cfg.region);
+        .unwrap_or("unknown");
 
     if let Some(id) = state.server_id {
         match hcloud.get_server(id).await {
@@ -1043,7 +1048,7 @@ mod tests {
     fn cfg_with(region: &str, regions: &[&str]) -> Config {
         Config {
             hetzner_token: "x".into(),
-            region: region.into(),
+            region: vec![region.into()],
             regions: regions.iter().map(|s| s.to_string()).collect(),
             server_type: "ccx63".into(),
             keep_alive_secs: 300,

@@ -24,25 +24,29 @@ use std::path::PathBuf;
 pub struct Config {
     /// Hetzner Cloud API token (read+write). Required.
     pub hetzner_token: String,
-    /// Hetzner location code (e.g. `hel1`, `nbg1`, `fsn1`, `ash`).
-    /// Treated as the sole region when `regions` is empty; otherwise
-    /// ignored. Kept for back-compat with existing configs and as the
-    /// single-region default for users who don't want fallbacks.
-    #[serde(default = "default_region")]
-    pub region: String,
-    /// Ordered preference list for server placement. When the first
-    /// region returns Hetzner's "resource_unavailable" capacity error,
-    /// we fall through to the next, and so on. Empty (the default)
-    /// means "use `region` as a single-element list".
+    /// Hetzner location codes (e.g. `hel1`, `nbg1`, `fsn1`, `ash`).
+    /// Accepts either a single string or a list — both are upgraded
+    /// to a list internally:
+    ///
+    ///     region = "hel1"                    # single region
+    ///     region = ["hel1", "fsn1"]          # ordered fallback list
+    ///
+    /// `regions` is an exact alias kept for users who prefer the
+    /// pluralised name; if both are set, `regions` wins. When the
+    /// first region returns Hetzner's "resource_unavailable" capacity
+    /// error, we fall through to the next, and so on.
     ///
     /// Volumes are regional in Hetzner — they only attach to servers
     /// in the same location — so falling back to a different region
     /// requires recreating the project volume there. The old volume
-    /// is deleted immediately (it's a build cache; the loss is one
-    /// fresh-build penalty, ~30s on a CCX63), and the next session
-    /// continues happily in the fallback region until that one runs
-    /// out too.
-    #[serde(default)]
+    /// is deleted (it's a build cache; the loss is one fresh-build
+    /// penalty, ~30s on a CCX63), and the next session continues in
+    /// the fallback region until that one runs out too.
+    #[serde(default = "default_region", deserialize_with = "one_or_many")]
+    pub region: Vec<String>,
+    /// Plural alias for `region`. Same string-or-list semantics. If
+    /// both `region` and `regions` are set, `regions` wins.
+    #[serde(default, deserialize_with = "one_or_many")]
     pub regions: Vec<String>,
     /// Hetzner server type (e.g. `ccx63`, `ccx53`, `ccx43`).
     #[serde(default = "default_server_type")]
@@ -71,7 +75,27 @@ pub struct Config {
     pub ssh_key_path: Option<PathBuf>,
 }
 
-fn default_region() -> String { "hel1".into() }
+fn default_region() -> Vec<String> { vec!["hel1".into()] }
+
+/// Accept either a TOML string or a TOML array-of-strings and produce
+/// a `Vec<String>`. Lets `region = "hel1"` and `region = ["hel1", "fsn1"]`
+/// both round-trip through the same field, so users don't have to
+/// remember whether the field is singular or plural.
+fn one_or_many<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(deserializer)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
 fn default_server_type() -> String { "ccx63".into() }
 fn default_keep_alive() -> u64 { 300 }
 fn default_volume_gb() -> u32 { 200 }
@@ -211,14 +235,17 @@ impl Config {
     }
 
     /// Ordered list of regions to try for server provisioning.
-    /// Returns `regions` verbatim when set+non-empty; otherwise wraps
-    /// the legacy `region` field in a single-element list. Always
-    /// returns at least one entry.
+    /// `regions` wins if set; otherwise `region`. If both are empty
+    /// (only possible when the user explicitly writes `region = []`)
+    /// we fall back to the global default so callers always get at
+    /// least one entry.
     pub fn region_preference(&self) -> Vec<String> {
         if !self.regions.is_empty() {
             self.regions.clone()
+        } else if !self.region.is_empty() {
+            self.region.clone()
         } else {
-            vec![self.region.clone()]
+            default_region()
         }
     }
 
@@ -338,4 +365,75 @@ where
     f(&mut state)?;
     state.save()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(toml: &str) -> Config {
+        toml::from_str(toml).expect("parse config")
+    }
+
+    #[test]
+    fn region_accepts_single_string() {
+        let cfg = parse(r#"hetzner_token = "x"
+region = "hel1""#);
+        assert_eq!(cfg.region, vec!["hel1".to_string()]);
+        assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
+    }
+
+    #[test]
+    fn region_accepts_array() {
+        let cfg = parse(r#"hetzner_token = "x"
+region = ["hel1", "fsn1", "nbg1"]"#);
+        assert_eq!(cfg.region, vec!["hel1", "fsn1", "nbg1"]);
+        assert_eq!(cfg.region_preference(), vec!["hel1", "fsn1", "nbg1"]);
+    }
+
+    #[test]
+    fn regions_alias_accepts_single_string() {
+        let cfg = parse(r#"hetzner_token = "x"
+regions = "fsn1""#);
+        assert_eq!(cfg.regions, vec!["fsn1".to_string()]);
+        // Plural wins when present, even as a single string.
+        assert_eq!(cfg.region_preference(), vec!["fsn1".to_string()]);
+    }
+
+    #[test]
+    fn regions_alias_accepts_array() {
+        let cfg = parse(r#"hetzner_token = "x"
+regions = ["hel1", "fsn1"]"#);
+        assert_eq!(cfg.regions, vec!["hel1", "fsn1"]);
+        assert_eq!(cfg.region_preference(), vec!["hel1", "fsn1"]);
+    }
+
+    #[test]
+    fn plural_regions_wins_when_both_set() {
+        let cfg = parse(r#"hetzner_token = "x"
+region = "hel1"
+regions = ["fsn1", "nbg1"]"#);
+        // Both fields keep their parsed values; preference picks regions.
+        assert_eq!(cfg.region, vec!["hel1".to_string()]);
+        assert_eq!(cfg.regions, vec!["fsn1", "nbg1"]);
+        assert_eq!(cfg.region_preference(), vec!["fsn1", "nbg1"]);
+    }
+
+    #[test]
+    fn region_defaults_when_neither_field_set() {
+        let cfg = parse(r#"hetzner_token = "x""#);
+        assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
+    }
+
+    #[test]
+    fn explicit_empty_array_falls_back_to_default() {
+        // `region = []` would otherwise produce an empty preference
+        // list, which every caller would have to defend against.
+        // region_preference returns the global default in that case.
+        let cfg = parse(r#"hetzner_token = "x"
+region = []"#);
+        assert!(cfg.region.is_empty());
+        assert!(cfg.regions.is_empty());
+        assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
+    }
 }

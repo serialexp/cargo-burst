@@ -11,7 +11,7 @@ pub async fn run() -> Result<()> {
     let state = State::load()?;
     let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
 
-    println!("region:       {}", cfg.region);
+    println!("regions:      {}", cfg.region_preference().join(", "));
     println!("server type:  {}", cfg.server_type);
     println!();
 

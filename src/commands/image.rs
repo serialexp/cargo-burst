@@ -82,7 +82,11 @@ pub async fn run(args: ImageBuildArgs) -> Result<()> {
             name: server_name.clone(),
             server_type: args.bake_server_type.clone(),
             image: ImageRef::Name("ubuntu-24.04".into()),
-            location: cfg.region.clone(),
+            // Image bake uses the user's first-preference region. No
+            // capacity fallback here: this is a manual, one-shot
+            // operation, and if that region is full the user can
+            // simply wait or re-run after rotating their config.
+            location: cfg.region_preference().remove(0),
             ssh_keys: vec![hetzner_key.id],
             volumes: vec![],
             user_data: Some(user_data),
