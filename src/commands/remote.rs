@@ -144,9 +144,34 @@ where
         // us bail early if they Ctrl-C at the prompt.
         let extra_excludes = scan_and_confirm_excludes(&project, &mut state, opts.yes)?;
 
-        let (volume, fresh_volume) = ensure_volume(&hcloud, &cfg, &project, &mut state).await?;
-        let (server, fresh_server) =
-            ensure_shared_server(&hcloud, &cfg, image_id, hetzner_key.id, &mut state).await?;
+        // Region-fallback path. We have to know the *server's* region
+        // before creating/reusing a volume, because Hetzner volumes are
+        // regional — a hel1 volume can't attach to a fsn1 server. So:
+        //   1. Peek at any existing volume's region (no state writes).
+        //   2. Compute the order in which to attempt regions: that
+        //      volume's region first (so we keep the cache when we can),
+        //      then the user's preference list, deduped.
+        //   3. Provision (or reuse) the server, falling through capacity
+        //      errors to the next region.
+        //   4. Match the volume to the server's actual region: existing
+        //      volume in the right region → reuse; wrong region → delete
+        //      and recreate (build cache rebuilds in ~30s, the alternative
+        //      is failing the build entirely).
+        let existing_volume_region =
+            peek_volume_region(&hcloud, &project, &state).await;
+        let attempt_regions =
+            compute_attempt_regions(&cfg, existing_volume_region.as_deref());
+        let (server, fresh_server, server_region) = ensure_shared_server(
+            &hcloud,
+            &cfg,
+            image_id,
+            hetzner_key.id,
+            &mut state,
+            &attempt_regions,
+        )
+        .await?;
+        let (volume, fresh_volume) =
+            ensure_volume(&hcloud, &cfg, &project, &mut state, &server_region).await?;
         let volume = ensure_volume_attached(&hcloud, volume, server.id).await?;
 
         // Bump this project's last_used immediately — see reap.rs's
@@ -362,36 +387,158 @@ fn spawn_heartbeat(project_hash: String) -> HeartbeatGuard {
 
 // ── Provisioning helpers ──────────────────────────────────────────────
 
+/// True if the error is Hetzner's "this server-type isn't currently
+/// available in this location" capacity signal (HTTP 412 + JSON body
+/// containing `code: "resource_unavailable"`).
+///
+/// Brittle by design: we deliberately don't broaden the predicate. A
+/// 412 with a different code (e.g. `unsupported_error`, `invalid_input`)
+/// means something we can't fix by trying another region, and silently
+/// retrying would mask real problems.
+fn is_capacity_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("resource_unavailable")
+}
+
+/// Read the project's existing volume's region without touching state.
+/// Used to bias the region-attempt order toward "wherever the cache
+/// already is" so a non-fallback run is identical to the pre-fallback
+/// behaviour: same region every time, no migration churn.
+async fn peek_volume_region(
+    hcloud: &HCloud,
+    project: &ProjectKey,
+    state: &State,
+) -> Option<String> {
+    if let Some(p) = state.projects.get(&project.hash) {
+        if let Some(id) = p.volume_id {
+            if let Ok(v) = hcloud.get_volume(id).await {
+                return v.location;
+            }
+        }
+    }
+    // State-less recovery path: volume might exist by name even if our
+    // local state.json was deleted.
+    match hcloud.find_volume(&project.volume_name()).await {
+        Ok(Some(v)) => v.location,
+        _ => None,
+    }
+}
+
+/// Compute the regions to try, in priority order, for server provisioning.
+///
+/// Rules:
+/// 1. If the project's existing volume is in a region that's *also* in
+///    the user's `regions` preference, try that region first — keeping
+///    the build cache is worth a few hundred ms of extra preference work.
+/// 2. Append every region from the preference list (deduped). The volume
+///    region might already be there; if so, step 1 hoisted it.
+/// 3. If the volume is in a region the user has since removed from their
+///    preference list, *don't* try that region (they explicitly opted out)
+///    — but emit a warning so the user knows the cache is about to be
+///    torn down on the first cold run.
+fn compute_attempt_regions(cfg: &Config, existing_volume_region: Option<&str>) -> Vec<String> {
+    let pref = cfg.region_preference();
+    let mut out: Vec<String> = Vec::with_capacity(pref.len());
+    if let Some(r) = existing_volume_region {
+        if pref.iter().any(|p| p == r) {
+            out.push(r.to_string());
+        } else {
+            tracing::warn!(
+                volume_region = r,
+                preference = ?pref,
+                "existing volume's region is not in the configured `regions` list; \
+                 it will be deleted and rebuilt in a configured region on next provision"
+            );
+        }
+    }
+    for r in pref {
+        if !out.iter().any(|x| x == &r) {
+            out.push(r);
+        }
+    }
+    out
+}
+
 async fn ensure_volume(
     hcloud: &HCloud,
     cfg: &Config,
     project: &ProjectKey,
     state: &mut State,
+    target_region: &str,
 ) -> Result<(Volume, bool)> {
     let p = state.projects.get_mut(&project.hash).expect("inserted earlier");
 
+    // (1) Try the volume cached in state. Region match → reuse;
+    // mismatch → orphan + delete (we can't attach across regions),
+    // not-found → forget and fall through.
     if let Some(id) = p.volume_id {
         match hcloud.get_volume(id).await {
-            Ok(v) => return Ok((v, false)),
+            Ok(v) => {
+                if v.location.as_deref() == Some(target_region) {
+                    return Ok((v, false));
+                }
+                tracing::warn!(
+                    volume = v.id,
+                    volume_region = ?v.location,
+                    server_region = target_region,
+                    "abandoning project volume — server fell back to a different region; \
+                     cache will rebuild on this run (~30s penalty)"
+                );
+                if let Err(e) = hcloud.delete_volume(v.id).await {
+                    tracing::warn!(
+                        volume = v.id,
+                        error = %e,
+                        "could not delete cross-region volume; you may need to clean it up manually"
+                    );
+                }
+                crate::audit::end_volume_session(
+                    p,
+                    &project.hash,
+                    v.id,
+                    crate::audit::TerminationReason::Stale,
+                );
+                p.volume_id = None;
+            }
             Err(e) => {
                 tracing::warn!("volume {id} from state.json not found ({e}); will recreate");
-                // Volume vanished server-side; close out the lifetime
-                // ledger before the upcoming `begin_volume_session`
-                // would emit an `orphaned` for it anyway.
-                crate::audit::end_volume_session(p, &project.hash, id, crate::audit::TerminationReason::Stale);
+                crate::audit::end_volume_session(
+                    p,
+                    &project.hash,
+                    id,
+                    crate::audit::TerminationReason::Stale,
+                );
                 p.volume_id = None;
             }
         }
     }
+
+    // (2) Try by name (state.json may be stale or freshly recreated).
+    // Same region rules as above.
     if let Some(v) = hcloud.find_volume(&project.volume_name()).await? {
-        tracing::info!(id = v.id, "found existing volume by name");
-        p.volume_id = Some(v.id);
-        return Ok((v, false));
+        if v.location.as_deref() == Some(target_region) {
+            tracing::info!(id = v.id, "found existing volume by name");
+            p.volume_id = Some(v.id);
+            return Ok((v, false));
+        }
+        tracing::warn!(
+            volume = v.id,
+            volume_region = ?v.location,
+            server_region = target_region,
+            "deleting by-name volume in wrong region"
+        );
+        if let Err(e) = hcloud.delete_volume(v.id).await {
+            tracing::warn!(
+                volume = v.id,
+                error = %e,
+                "could not delete cross-region volume; you may need to clean it up manually"
+            );
+        }
     }
 
+    // (3) Create fresh in the target region.
     tracing::info!(
         name = %project.volume_name(),
         size_gb = cfg.volume_gb,
+        region = target_region,
         "creating new volume"
     );
     let mut labels = HashMap::new();
@@ -401,7 +548,7 @@ async fn ensure_volume(
         .create_volume(CreateVolumeRequest {
             name: project.volume_name(),
             size: cfg.volume_gb,
-            location: cfg.region.clone(),
+            location: target_region.to_string(),
             format: "ext4".into(),
             labels,
             automount: false,
@@ -419,23 +566,45 @@ async fn ensure_volume(
         &project.hash,
         resp.volume.id,
         cfg.volume_gb,
-        &cfg.region,
+        target_region,
     );
     Ok((resp.volume, true))
 }
 
+/// Provision (or reuse) the shared server, trying each region in
+/// `attempt_regions` until one accepts the create or all fail. The
+/// returned `String` is the region the server actually ended up in —
+/// used downstream to align the project's volume.
+///
+/// Reuse path is unchanged: if a running server already exists (per
+/// state, or by name lookup) we just hand it back; the region we
+/// return is read from the server's `datacenter.location.name`.
 async fn ensure_shared_server(
     hcloud: &HCloud,
     cfg: &Config,
     image_id: i64,
     ssh_key_id: i64,
     state: &mut State,
-) -> Result<(Server, bool)> {
+    attempt_regions: &[String],
+) -> Result<(Server, bool, String)> {
+    fn server_region(server: &Server, fallback: &str) -> String {
+        server
+            .datacenter
+            .as_ref()
+            .map(|d| d.location.name.clone())
+            .unwrap_or_else(|| fallback.to_string())
+    }
+    let region_fallback: &str = attempt_regions
+        .first()
+        .map(String::as_str)
+        .unwrap_or(&cfg.region);
+
     if let Some(id) = state.server_id {
         match hcloud.get_server(id).await {
             Ok(s) if matches!(s.status.as_str(), "running" | "starting" | "initializing") => {
-                tracing::info!(id, status = %s.status, "reusing shared server from state");
-                return Ok((s, false));
+                let region = server_region(&s, region_fallback);
+                tracing::info!(id, status = %s.status, region = %region, "reusing shared server from state");
+                return Ok((s, false, region));
             }
             Ok(s) => {
                 tracing::warn!(id, status = %s.status, "stale server in state; deleting");
@@ -455,53 +624,80 @@ async fn ensure_shared_server(
 
     if let Some(s) = hcloud.find_server(SHARED_SERVER_NAME).await? {
         if matches!(s.status.as_str(), "running" | "starting" | "initializing") {
-            tracing::info!(id = s.id, status = %s.status, "found shared server by name");
+            let region = server_region(&s, region_fallback);
+            tracing::info!(id = s.id, status = %s.status, region = %region, "found shared server by name");
             state.server_id = Some(s.id);
-            return Ok((s, false));
+            return Ok((s, false, region));
         }
         tracing::warn!(id = s.id, status = %s.status, "deleting stale server found by name");
         let _ = hcloud.delete_server(s.id).await;
         crate::audit::end_server_session(state, s.id, crate::audit::TerminationReason::Stale);
     }
 
-    tracing::info!(
-        name = SHARED_SERVER_NAME,
-        image = image_id,
-        server_type = %cfg.server_type,
-        "provisioning shared server"
-    );
-    let mut labels = HashMap::new();
-    labels.insert("managed-by".into(), "cargo-burst".into());
-    labels.insert("role".into(), "shared".into());
-    let create = hcloud
-        .create_server(CreateServerRequest {
-            name: SHARED_SERVER_NAME.to_string(),
-            server_type: cfg.server_type.clone(),
-            image: ImageRef::Id(image_id),
-            location: cfg.region.clone(),
-            ssh_keys: vec![ssh_key_id],
-            volumes: vec![],
-            user_data: None,
-            labels,
-            start_after_create: true,
-        })
-        .await?;
-
-    hcloud
-        .wait_action(create.action.id, SERVER_BOOT_TIMEOUT)
-        .await
-        .context("waiting for server-create action")?;
-
-    let server = hcloud.get_server(create.server.id).await?;
-    state.server_id = Some(server.id);
-    crate::audit::begin_server_session(
-        state,
-        server.id,
-        &cfg.server_type,
-        image_id,
-        &cfg.region,
-    );
-    Ok((server, true))
+    // Provisioning loop: try each region in preference order, fall
+    // through capacity errors only. Other errors (auth, quota, network)
+    // won't get better by changing region, so propagate immediately.
+    if attempt_regions.is_empty() {
+        return Err(anyhow!(
+            "no regions configured for provisioning (set `regions = [\"hel1\", …]` in config.toml)"
+        ));
+    }
+    let mut last_err: Option<anyhow::Error> = None;
+    for region in attempt_regions {
+        tracing::info!(
+            name = SHARED_SERVER_NAME,
+            image = image_id,
+            server_type = %cfg.server_type,
+            region = %region,
+            "provisioning shared server"
+        );
+        let mut labels = HashMap::new();
+        labels.insert("managed-by".into(), "cargo-burst".into());
+        labels.insert("role".into(), "shared".into());
+        let res = hcloud
+            .create_server(CreateServerRequest {
+                name: SHARED_SERVER_NAME.to_string(),
+                server_type: cfg.server_type.clone(),
+                image: ImageRef::Id(image_id),
+                location: region.clone(),
+                ssh_keys: vec![ssh_key_id],
+                volumes: vec![],
+                user_data: None,
+                labels,
+                start_after_create: true,
+            })
+            .await;
+        match res {
+            Ok(create) => {
+                hcloud
+                    .wait_action(create.action.id, SERVER_BOOT_TIMEOUT)
+                    .await
+                    .context("waiting for server-create action")?;
+                let server = hcloud.get_server(create.server.id).await?;
+                state.server_id = Some(server.id);
+                crate::audit::begin_server_session(
+                    state,
+                    server.id,
+                    &cfg.server_type,
+                    image_id,
+                    region,
+                );
+                return Ok((server, true, region.clone()));
+            }
+            Err(e) if is_capacity_error(&e) => {
+                tracing::warn!(region = %region, error = %e, "region at capacity; trying next");
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(anyhow!(
+        "every region in the preference list ({:?}) reported `resource_unavailable`; \
+         try again later, or add another region to your config",
+        attempt_regions
+    )
+    .context(last_err.unwrap_or_else(|| anyhow!("no last error captured"))))
 }
 
 async fn ensure_volume_attached(
@@ -842,5 +1038,81 @@ mod tests {
         assert_eq!(label_to_verb("Check"), "check");
         assert_eq!(label_to_verb("Clippy"), "clippy");
         assert_eq!(label_to_verb("Bench"), "bench");
+    }
+
+    fn cfg_with(region: &str, regions: &[&str]) -> Config {
+        Config {
+            hetzner_token: "x".into(),
+            region: region.into(),
+            regions: regions.iter().map(|s| s.to_string()).collect(),
+            server_type: "ccx63".into(),
+            keep_alive_secs: 300,
+            volume_keep_alive_secs: 3600,
+            volume_gb: 200,
+            ssh_key_path: None,
+        }
+    }
+
+    #[test]
+    fn attempt_regions_default_path() {
+        // No `regions` configured → `region` becomes a single-element
+        // list. No existing volume → that single element is what we try.
+        let cfg = cfg_with("hel1", &[]);
+        assert_eq!(compute_attempt_regions(&cfg, None), vec!["hel1"]);
+    }
+
+    #[test]
+    fn attempt_regions_existing_volume_hoists_its_region() {
+        // `regions = ["hel1", "fsn1", "nbg1"]`, volume already in fsn1
+        // → fsn1 first (cache-preserving), then hel1 and nbg1.
+        let cfg = cfg_with("hel1", &["hel1", "fsn1", "nbg1"]);
+        assert_eq!(
+            compute_attempt_regions(&cfg, Some("fsn1")),
+            vec!["fsn1", "hel1", "nbg1"]
+        );
+    }
+
+    #[test]
+    fn attempt_regions_volume_in_region_thats_not_in_pref_list() {
+        // User has a volume in nbg1 but reconfigured `regions` to omit
+        // nbg1. We should try only the configured regions and let the
+        // ensure_volume cleanup path delete the now-orphaned volume.
+        let cfg = cfg_with("hel1", &["hel1", "fsn1"]);
+        assert_eq!(
+            compute_attempt_regions(&cfg, Some("nbg1")),
+            vec!["hel1", "fsn1"]
+        );
+    }
+
+    #[test]
+    fn attempt_regions_dedup_when_volume_already_first() {
+        let cfg = cfg_with("hel1", &["hel1", "fsn1"]);
+        // Volume is in hel1 (first preference). Don't double up.
+        assert_eq!(
+            compute_attempt_regions(&cfg, Some("hel1")),
+            vec!["hel1", "fsn1"]
+        );
+    }
+
+    #[test]
+    fn capacity_error_recognized_in_real_hetzner_body() {
+        // Verbatim 412 body shape we get back from POST /servers when
+        // a CCX63 isn't currently available in the requested region.
+        let e = anyhow!(
+            "POST https://api.hetzner.cloud/v1/servers → 412 Precondition Failed: \
+             {{\"error\":{{\"code\":\"resource_unavailable\",\
+             \"message\":\"error during placement\",\"details\":{{}}}}}}"
+        );
+        assert!(is_capacity_error(&e));
+    }
+
+    #[test]
+    fn other_412s_are_not_capacity_errors() {
+        // Different 412 codes mean things we can't fix by trying
+        // another region — must surface to the user.
+        let e = anyhow!("POST → 412 Precondition Failed: code:\"invalid_input\"");
+        assert!(!is_capacity_error(&e));
+        let e = anyhow!("POST → 401 Unauthorized");
+        assert!(!is_capacity_error(&e));
     }
 }

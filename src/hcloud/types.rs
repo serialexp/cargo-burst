@@ -39,6 +39,24 @@ pub struct Server {
     pub status: String,
     pub public_net: PublicNet,
     pub server_type: ServerType,
+    /// Datacenter the server is placed in. Hetzner nests the
+    /// human-readable region (`hel1`, `fsn1`, …) under
+    /// `datacenter.location.name`. Optional in the deserializer
+    /// because some endpoints return abbreviated server objects;
+    /// `create_server` and `get_server` always include it in
+    /// practice.
+    #[serde(default)]
+    pub datacenter: Option<Datacenter>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Datacenter {
+    pub location: DatacenterLocation,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DatacenterLocation {
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +125,30 @@ pub struct Volume {
     /// Server ID this volume is currently attached to, if any.
     #[serde(default)]
     pub server: Option<i64>,
+    /// Hetzner location code the volume lives in (e.g. `hel1`).
+    /// Volumes are regional — they can only attach to servers in
+    /// the same location — so we need this to decide whether an
+    /// existing volume is usable when the server falls back to a
+    /// different region. Hetzner inlines the location at the top
+    /// level of a Volume object (not nested under `datacenter`),
+    /// hence the flat field.
+    #[serde(default, deserialize_with = "deserialize_volume_location")]
+    pub location: Option<String>,
+}
+
+/// Hetzner returns volume location as a nested object
+/// `{"name":"hel1", ...}`. We only care about the name; collapse it
+/// to a `String` at deserialize time.
+fn deserialize_volume_location<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct LocationObj {
+        name: String,
+    }
+    let opt: Option<LocationObj> = Option::deserialize(deserializer)?;
+    Ok(opt.map(|l| l.name))
 }
 
 #[derive(Serialize, Debug)]

@@ -36,7 +36,15 @@ cargo install --git https://github.com/serialexp/cargo-burst
 mkdir -p ~/.config/cargo-burst
 cat > ~/.config/cargo-burst/config.toml <<'EOF'
 hetzner_token          = "<your token here>"
-region                 = "hel1"
+# Try regions in this order when provisioning a server. Each entry is
+# an Hetzner location code (`hel1`, `fsn1`, `nbg1`, `ash`, `sin`, …).
+# If the first region returns "resource_unavailable" (CCX-class fully
+# booked), the next is tried automatically. Volumes are regional, so
+# falling back rebuilds the project's build cache in the new region
+# (~30s penalty).
+regions                = ["hel1", "fsn1", "nbg1"]
+# Or, for a single region with no fallback:
+# region               = "hel1"
 server_type            = "ccx63"
 keep_alive_secs        = 300       # server reaper: 5 min idle
 volume_keep_alive_secs = 3600      # volume reaper: 1 hour idle (per project)

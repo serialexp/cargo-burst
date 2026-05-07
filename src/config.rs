@@ -25,8 +25,25 @@ pub struct Config {
     /// Hetzner Cloud API token (read+write). Required.
     pub hetzner_token: String,
     /// Hetzner location code (e.g. `hel1`, `nbg1`, `fsn1`, `ash`).
+    /// Treated as the sole region when `regions` is empty; otherwise
+    /// ignored. Kept for back-compat with existing configs and as the
+    /// single-region default for users who don't want fallbacks.
     #[serde(default = "default_region")]
     pub region: String,
+    /// Ordered preference list for server placement. When the first
+    /// region returns Hetzner's "resource_unavailable" capacity error,
+    /// we fall through to the next, and so on. Empty (the default)
+    /// means "use `region` as a single-element list".
+    ///
+    /// Volumes are regional in Hetzner — they only attach to servers
+    /// in the same location — so falling back to a different region
+    /// requires recreating the project volume there. The old volume
+    /// is deleted immediately (it's a build cache; the loss is one
+    /// fresh-build penalty, ~30s on a CCX63), and the next session
+    /// continues happily in the fallback region until that one runs
+    /// out too.
+    #[serde(default)]
+    pub regions: Vec<String>,
     /// Hetzner server type (e.g. `ccx63`, `ccx53`, `ccx43`).
     #[serde(default = "default_server_type")]
     pub server_type: String,
@@ -191,6 +208,18 @@ impl Config {
             ));
         }
         Ok(cfg)
+    }
+
+    /// Ordered list of regions to try for server provisioning.
+    /// Returns `regions` verbatim when set+non-empty; otherwise wraps
+    /// the legacy `region` field in a single-element list. Always
+    /// returns at least one entry.
+    pub fn region_preference(&self) -> Vec<String> {
+        if !self.regions.is_empty() {
+            self.regions.clone()
+        } else {
+            vec![self.region.clone()]
+        }
     }
 
     /// Resolved SSH key path: explicit `ssh_key_path` if set, else the
