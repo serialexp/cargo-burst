@@ -55,6 +55,13 @@ pub struct RemoteCtx {
     pub target_dir: String,
     /// `/mnt/cache/<hash>/sccache` — `SCCACHE_DIR` for the run.
     pub sccache_dir: String,
+    /// Resolved environment variables to export ahead of every cargo
+    /// invocation. Already merged across global config, project
+    /// config, and CLI `--env` flags by the time the closure sees it
+    /// (CLI wins, project additive over global). Names here always
+    /// have a concrete value — entries that resolved to "no value"
+    /// were filtered out.
+    pub env: Vec<(String, String)>,
 }
 
 /// Knobs callers expose to users (mirrored on every subcommand that
@@ -67,6 +74,10 @@ pub struct RemoteOptions {
     /// Don't schedule reapers — leave the server (and volume) alive
     /// indefinitely.
     pub no_reap: bool,
+    /// Raw `--env` flag values from the CLI (`VAR` or `VAR=value`).
+    /// Resolved against the local environment inside `with_remote`,
+    /// then merged with `Config.forward_env`.
+    pub cli_env: Vec<String>,
 }
 
 /// Run `f` on a prepared remote.
@@ -93,9 +104,6 @@ where
     F: FnOnce(RemoteCtx) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let cfg = Config::load()?;
-    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
-
     let cwd = std::env::current_dir().context("getting current dir")?;
     let project = ProjectKey::discover(&cwd)?;
     tracing::info!(
@@ -103,6 +111,23 @@ where
         hash = %project.hash,
         "resolved cargo workspace"
     );
+
+    // Load global config and layer the project's
+    // `.config/cargo-burst.toml` on top, if present. This has to
+    // happen *after* workspace discovery (we need the path) but
+    // before anything that consumes config — most notably the HCloud
+    // client (whose token comes from config) and the env-resolution
+    // step below (which reads `cfg.forward_env`).
+    let cfg = Config::load_for_workspace(Some(&project.workspace_root))?;
+    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
+
+    // Resolve the merged environment now so it's a flat
+    // `Vec<(name, value)>` by the time `build_remote_cmd` consumes
+    // it. Local env lookups happen here, on the host that actually
+    // has the values — moving this work into `build_remote_cmd`
+    // would mean re-reading `std::env` for every cargo phase even
+    // though nothing about it changes mid-run.
+    let env = resolve_env(&cfg.forward_env, &opts.cli_env);
 
     // Wall-time anchor for the audit log's `provision_secs` — we want
     // to attribute "everything before cargo runs" to provisioning, so
@@ -252,6 +277,7 @@ where
         remote_src: remote_src.clone(),
         target_dir,
         sccache_dir,
+        env: env.clone(),
     };
 
     let cargo_start = Instant::now();
@@ -1006,17 +1032,37 @@ pub const DB_WAIT_PREFIX: &str =
 
 /// Render the boilerplate that wraps every cargo invocation: pin
 /// `CARGO_TARGET_DIR` and `SCCACHE_DIR` to the project's volume slot,
-/// put `~/.cargo/bin` on PATH (so `cargo-nextest` is reachable), make
-/// sure those dirs exist, and `cd` into the rsync'd source.
+/// put `~/.cargo/bin` on PATH (so `cargo-nextest` is reachable), export
+/// any user-forwarded env vars (from `forward_env` config + `--env`
+/// flags, already resolved into `ctx.env`), make sure target/sccache
+/// dirs exist, and `cd` into the rsync'd source.
+///
+/// User-forwarded vars are exported *after* our internal pins, so a
+/// user can't accidentally clobber `CARGO_TARGET_DIR` (we'd lose the
+/// volume cache benefit) or `PATH` (we'd lose `cargo-nextest`).
+/// Refusing those names is enforced upstream in `resolve_env` —
+/// here we trust the input.
 ///
 /// `body` is appended after the prelude — typically one or more
 /// `cargo …` invocations. Combine with `&&` if you're chaining.
 pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
+    let user_exports = ctx
+        .env
+        .iter()
+        .map(|(k, v)| format!("export {k}={};", shell_escape(v)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let user_exports = if user_exports.is_empty() {
+        String::new()
+    } else {
+        format!("{user_exports} ")
+    };
     format!(
         "set -euo pipefail; \
          export CARGO_TARGET_DIR={target}; \
          export SCCACHE_DIR={sccache}; \
          export PATH=$HOME/.cargo/bin:$PATH; \
+         {user_exports}\
          mkdir -p {target} {sccache}; \
          cd {src}; \
          {body}",
@@ -1024,6 +1070,101 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
         sccache = ctx.sccache_dir,
         src = ctx.remote_src,
     )
+}
+
+/// Names we refuse to forward to the remote even if the user asks.
+/// These are either pinned by `build_remote_cmd` itself (clobbering
+/// them would silently break the cache or runtime), or completely
+/// host-specific and meaningless on the remote (HOME/USER/PATH
+/// pointing at the local filesystem).
+const FORBIDDEN_ENV_NAMES: &[&str] = &[
+    "CARGO_TARGET_DIR",
+    "SCCACHE_DIR",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PWD",
+    "OLDPWD",
+    "SHELL",
+];
+
+/// Combine the global+project `forward_env` allow-list with per-run
+/// `--env` flags into a flat `Vec<(name, value)>` ready for export
+/// on the remote.
+///
+/// Resolution rules:
+///
+/// 1. For each name in `forward_env`, look up `std::env::var(name)`.
+///    Unset → skip with a debug log (it's fine to keep `RUST_LOG` in
+///    the list across runs where you didn't set it).
+/// 2. For each `--env` flag value:
+///    - `NAME` → forward `$NAME` from local. If unset, *warn* — the
+///      user explicitly asked for this one, so silence would mask a
+///      typo or shell-startup bug.
+///    - `NAME=value` → set verbatim. The value goes through verbatim;
+///      shell-escaping happens later in `build_remote_cmd`.
+/// 3. `--env` wins over `forward_env` on duplicate names (last one
+///    wins among `--env` itself, in argv order).
+/// 4. [`FORBIDDEN_ENV_NAMES`] are dropped with a warning. Forwarding
+///    them would either silently break the remote build or carry
+///    host-only paths into a different filesystem.
+pub fn resolve_env(forward: &[String], cli_env: &[String]) -> Vec<(String, String)> {
+    use std::collections::BTreeMap;
+
+    // BTreeMap so output ordering is stable (handy for tests and for
+    // the eventual shell command being deterministic).
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+
+    let forbidden = |name: &str| FORBIDDEN_ENV_NAMES.iter().any(|n| *n == name);
+
+    for name in forward {
+        if forbidden(name) {
+            tracing::warn!(name, "refusing to forward reserved env var");
+            continue;
+        }
+        match std::env::var(name) {
+            Ok(value) => {
+                out.insert(name.clone(), value);
+            }
+            Err(_) => {
+                tracing::debug!(name, "forward_env entry is locally unset; skipping");
+            }
+        }
+    }
+
+    for spec in cli_env {
+        let (name, value) = match spec.split_once('=') {
+            Some((n, v)) => (n.to_string(), Some(v.to_string())),
+            None => (spec.clone(), None),
+        };
+        if name.is_empty() {
+            tracing::warn!(spec, "ignoring `--env` with empty name");
+            continue;
+        }
+        if forbidden(&name) {
+            tracing::warn!(name, "refusing to forward reserved env var");
+            continue;
+        }
+        match value {
+            Some(v) => {
+                out.insert(name, v);
+            }
+            None => match std::env::var(&name) {
+                Ok(v) => {
+                    out.insert(name, v);
+                }
+                Err(_) => {
+                    // Explicit `--env NAME` with no local value is
+                    // worth surfacing — unlike forward_env's standing
+                    // list, this was a one-off ask.
+                    tracing::warn!(name, "`--env {}` is locally unset; not forwarding", name);
+                }
+            },
+        }
+    }
+
+    out.into_iter().collect()
 }
 
 /// Map the human-readable label that subcommands pass into `with_remote`
@@ -1091,6 +1232,7 @@ mod tests {
             volume_keep_alive_secs: 3600,
             volume_gb: 200,
             ssh_key_path: None,
+            forward_env: Vec::new(),
         }
     }
 
@@ -1197,5 +1339,143 @@ mod tests {
         assert!(!is_capacity_error(&e));
         let e = anyhow!("POST → 401 Unauthorized");
         assert!(!is_capacity_error(&e));
+    }
+
+    /// Pick env var names with a `CARGO_BURST_TEST_` prefix so we don't
+    /// stomp on anything the user might already have set when running
+    /// the suite locally. Tests that need to control a value set it
+    /// explicitly; tests that need it unset use a name unlikely to
+    /// exist (`_NEVER_SET_<rand>`).
+    #[test]
+    fn resolve_env_skips_unset_forward_entries() {
+        // Pick a name that's almost certainly not in the test process's
+        // environment. We never set it.
+        let v = resolve_env(
+            &["CARGO_BURST_TEST_DEFINITELY_UNSET_XYZZY".into()],
+            &[],
+        );
+        assert!(v.is_empty(), "unset forward_env entries must be dropped");
+    }
+
+    #[test]
+    fn resolve_env_picks_up_set_forward_entries() {
+        // Set a unique-named var, ask resolve_env to forward it, expect
+        // the resolved (k,v) pair.
+        let name = "CARGO_BURST_TEST_FWD_OK";
+        // SAFETY: tests can race other tests touching the same env var.
+        // We use a unique name per test to avoid that.
+        unsafe { std::env::set_var(name, "yes please"); }
+        let v = resolve_env(&[name.into()], &[]);
+        unsafe { std::env::remove_var(name); }
+        assert_eq!(v, vec![(name.to_string(), "yes please".to_string())]);
+    }
+
+    #[test]
+    fn resolve_env_cli_inline_value_wins() {
+        let name = "CARGO_BURST_TEST_CLI_WINS";
+        unsafe { std::env::set_var(name, "from-shell"); }
+        let v = resolve_env(
+            &[name.into()],
+            &[format!("{name}=from-cli")],
+        );
+        unsafe { std::env::remove_var(name); }
+        assert_eq!(v, vec![(name.to_string(), "from-cli".to_string())]);
+    }
+
+    #[test]
+    fn resolve_env_cli_bare_name_resolves_locally() {
+        let name = "CARGO_BURST_TEST_CLI_BARE";
+        unsafe { std::env::set_var(name, "looked up"); }
+        let v = resolve_env(&[], &[name.into()]);
+        unsafe { std::env::remove_var(name); }
+        assert_eq!(v, vec![(name.to_string(), "looked up".to_string())]);
+    }
+
+    #[test]
+    fn resolve_env_value_with_equals_in_it_survives() {
+        // `--env DSN=postgres://u:p@h/db?sslmode=disable` — the second
+        // `=` is part of the value, not a key separator. split_once
+        // handles this correctly; verify.
+        let v = resolve_env(
+            &[],
+            &["DSN=postgres://u:p@h/db?sslmode=disable".into()],
+        );
+        assert_eq!(
+            v,
+            vec![(
+                "DSN".to_string(),
+                "postgres://u:p@h/db?sslmode=disable".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn resolve_env_drops_forbidden_names() {
+        // Even if the user explicitly asks, we refuse PATH/HOME/CARGO_TARGET_DIR.
+        let v = resolve_env(
+            &["PATH".into(), "CARGO_TARGET_DIR".into()],
+            &["HOME=/who/cares".into()],
+        );
+        assert!(v.is_empty(), "forbidden names must never reach the remote");
+    }
+
+    #[test]
+    fn build_remote_cmd_emits_user_exports_after_pins() {
+        let ctx = RemoteCtx {
+            server_ip: "1.2.3.4".into(),
+            ssh_key_path: PathBuf::from("/dev/null"),
+            workspace_root: PathBuf::from("/tmp"),
+            remote_src: "/home/work/src/abc".into(),
+            target_dir: "/mnt/cache/abc/target".into(),
+            sccache_dir: "/mnt/cache/abc/sccache".into(),
+            env: vec![
+                ("RUST_LOG".into(), "debug".into()),
+                // Value with spaces + `?` glob meta — must be quoted
+                // by shell_escape, otherwise the remote shell would
+                // tokenise it into multiple positional args and the
+                // export would be malformed.
+                (
+                    "MESSAGE".into(),
+                    "hello world ?".into(),
+                ),
+            ],
+        };
+        let cmd = build_remote_cmd(&ctx, "cargo build");
+
+        // Pins come first.
+        let cargo_target_pos = cmd.find("export CARGO_TARGET_DIR").unwrap();
+        let user_pos = cmd.find("export RUST_LOG").unwrap();
+        assert!(
+            cargo_target_pos < user_pos,
+            "user-forwarded env must be exported AFTER our internal \
+             pins so the user can't accidentally clobber them"
+        );
+
+        // Values that contain shell metacharacters get single-quoted.
+        assert!(
+            cmd.contains("export MESSAGE='hello world ?';"),
+            "MESSAGE value must be shell-quoted; got: {cmd}"
+        );
+        // RUST_LOG=debug is alphanumeric only — shell_escape correctly
+        // leaves it bare. Just confirm it's there.
+        assert!(cmd.contains("export RUST_LOG=debug;"));
+    }
+
+    #[test]
+    fn build_remote_cmd_no_env_omits_user_exports_block() {
+        let ctx = RemoteCtx {
+            server_ip: "1.2.3.4".into(),
+            ssh_key_path: PathBuf::from("/dev/null"),
+            workspace_root: PathBuf::from("/tmp"),
+            remote_src: "/home/work/src/abc".into(),
+            target_dir: "/mnt/cache/abc/target".into(),
+            sccache_dir: "/mnt/cache/abc/sccache".into(),
+            env: vec![],
+        };
+        let cmd = build_remote_cmd(&ctx, "cargo check");
+        // Should still produce valid syntax — the empty user_exports
+        // block musn't leave a dangling `; ` that breaks the chain.
+        assert!(cmd.contains("export PATH=$HOME/.cargo/bin:$PATH;"));
+        assert!(cmd.contains("mkdir -p /mnt/cache/abc/target /mnt/cache/abc/sccache;"));
     }
 }

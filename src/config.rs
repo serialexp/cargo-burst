@@ -16,7 +16,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// User-edited settings. Defaults are filled in for any missing field so
 /// users only have to write the parts they actually want to change.
@@ -73,6 +73,57 @@ pub struct Config {
     /// Defaults to `<config_dir>/ssh_key`. Created on first use if missing.
     #[serde(default)]
     pub ssh_key_path: Option<PathBuf>,
+    /// Names of local environment variables to forward to every remote
+    /// `cargo …` invocation. Names whose local value is unset are
+    /// silently skipped (debug-logged), so it's fine to keep
+    /// `RUST_LOG` in the list even on runs where you didn't set it.
+    ///
+    /// Per-run `--env VAR` and `--env VAR=value` always win over this
+    /// list; project-level config (`<workspace>/.config/cargo-burst.toml`)
+    /// is appended to this list (additive merge).
+    ///
+    /// Default empty — opting in is explicit so we never silently
+    /// leak host-specific state.
+    #[serde(default)]
+    pub forward_env: Vec<String>,
+}
+
+/// All-optional patch deserialised from
+/// `<workspace>/.config/cargo-burst.toml`. Fields that are `Some(_)`
+/// override the corresponding global config field; `forward_env` is
+/// the one exception — it's *additive* (project list appended to
+/// global, deduped) so a project can add to the global allow-list
+/// without having to repeat what the user already configured globally.
+///
+/// `hetzner_token` is intentionally accepted by the deserializer (so
+/// a typo'd token field doesn't fail parsing in some confusing way)
+/// but rejected with a clear error in [`Config::load_for_workspace`] —
+/// committing a token is a security incident waiting to happen.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Refused — present only so the deserializer can produce a
+    /// targeted error rather than "unknown field".
+    #[serde(default)]
+    pub hetzner_token: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub region: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub regions: Option<Vec<String>>,
+    #[serde(default)]
+    pub server_type: Option<String>,
+    #[serde(default)]
+    pub keep_alive_secs: Option<u64>,
+    #[serde(default)]
+    pub volume_keep_alive_secs: Option<u64>,
+    #[serde(default)]
+    pub volume_gb: Option<u32>,
+    #[serde(default)]
+    pub ssh_key_path: Option<PathBuf>,
+    /// Appended to the global `forward_env`, deduped (preserves
+    /// global ordering, then project ordering for new entries).
+    #[serde(default)]
+    pub forward_env: Option<Vec<String>>,
 }
 
 fn default_region() -> Vec<String> { vec!["hel1".into()] }
@@ -94,6 +145,30 @@ where
     Ok(match OneOrMany::deserialize(deserializer)? {
         OneOrMany::One(s) => vec![s],
         OneOrMany::Many(v) => v,
+    })
+}
+
+/// `Option<Vec<String>>` variant of [`one_or_many`]: a missing field
+/// stays `None` (so we can tell "user didn't set this in the project
+/// file" apart from "user explicitly set it to []") while a present
+/// string-or-array deserialises into `Some(_)`.
+fn one_or_many_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Option::<OneOrMany>::deserialize(deserializer).map(|opt| {
+        opt.map(|v| match v {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        })
     })
 }
 fn default_server_type() -> String { "ccx63".into() }
@@ -212,10 +287,34 @@ pub fn config_dir() -> Result<PathBuf> {
 pub fn config_path() -> Result<PathBuf> { Ok(config_dir()?.join("config.toml")) }
 pub fn state_path()  -> Result<PathBuf> { Ok(config_dir()?.join("state.json")) }
 
+/// Path to the project-level config file inside a workspace, if it
+/// exists. Mirrors cargo-nextest's convention of stashing per-project
+/// tool config under `<workspace>/.config/<tool>.toml` so projects
+/// don't accumulate a flotilla of dotfiles at the root.
+pub fn project_config_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".config").join("cargo-burst.toml")
+}
+
 impl Config {
     /// Load `config.toml`. Returns a helpful error pointing at the path if
     /// missing — first-run UX is "the tool tells you where to put the file".
     pub fn load() -> Result<Self> {
+        Self::load_for_workspace(None)
+    }
+
+    /// Load global config and, if `workspace_root` is `Some(_)` and a
+    /// `<workspace>/.config/cargo-burst.toml` exists, layer it on top.
+    ///
+    /// Project-config rules (kept in lockstep with the docs on
+    /// [`ProjectConfig`]):
+    ///
+    /// - All non-`forward_env` fields *replace* the global value when set.
+    /// - `forward_env` is *additive* — project list appended to global,
+    ///   deduped, preserving the global ordering for entries that
+    ///   appear in both.
+    /// - `hetzner_token` is rejected outright; tokens belong in the
+    ///   per-user global config, not in a file that gets committed.
+    pub fn load_for_workspace(workspace_root: Option<&Path>) -> Result<Self> {
         let path = config_path()?;
         let text = fs::read_to_string(&path).with_context(|| {
             format!(
@@ -223,7 +322,7 @@ impl Config {
                 path.display()
             )
         })?;
-        let cfg: Config = toml::from_str(&text)
+        let mut cfg: Config = toml::from_str(&text)
             .with_context(|| format!("parsing {}", path.display()))?;
         if cfg.hetzner_token.trim().is_empty() {
             return Err(anyhow!(
@@ -231,7 +330,75 @@ impl Config {
                 path.display()
             ));
         }
+
+        if let Some(root) = workspace_root {
+            let proj_path = project_config_path(root);
+            match fs::read_to_string(&proj_path) {
+                Ok(proj_text) => {
+                    let project: ProjectConfig = toml::from_str(&proj_text)
+                        .with_context(|| format!("parsing {}", proj_path.display()))?;
+                    if project.hetzner_token.is_some() {
+                        return Err(anyhow!(
+                            "{} sets `hetzner_token`, which is refused at the \
+                             project level — tokens belong in your global \
+                             {} (this file is meant to be committed; tokens are not)",
+                            proj_path.display(),
+                            path.display(),
+                        ));
+                    }
+                    cfg.merge_project(project);
+                    tracing::debug!(
+                        path = %proj_path.display(),
+                        "applied project config"
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(anyhow!("reading {}: {e}", proj_path.display()));
+                }
+            }
+        }
+
         Ok(cfg)
+    }
+
+    /// Apply a [`ProjectConfig`] patch in place. Replace semantics for
+    /// every field except `forward_env`, which is appended-and-deduped.
+    /// Public for tests; production callers should go through
+    /// [`Config::load_for_workspace`].
+    pub fn merge_project(&mut self, project: ProjectConfig) {
+        if let Some(v) = project.region {
+            self.region = v;
+        }
+        if let Some(v) = project.regions {
+            self.regions = v;
+        }
+        if let Some(v) = project.server_type {
+            self.server_type = v;
+        }
+        if let Some(v) = project.keep_alive_secs {
+            self.keep_alive_secs = v;
+        }
+        if let Some(v) = project.volume_keep_alive_secs {
+            self.volume_keep_alive_secs = v;
+        }
+        if let Some(v) = project.volume_gb {
+            self.volume_gb = v;
+        }
+        if let Some(v) = project.ssh_key_path {
+            self.ssh_key_path = Some(v);
+        }
+        if let Some(extra) = project.forward_env {
+            // Preserve global ordering for shared entries; append
+            // project-only entries in their original order. Linear
+            // scans are fine — these lists are typically a handful
+            // of names, not thousands.
+            for name in extra {
+                if !self.forward_env.iter().any(|n| n == &name) {
+                    self.forward_env.push(name);
+                }
+            }
+        }
     }
 
     /// Ordered list of regions to try for server provisioning.
@@ -423,6 +590,80 @@ regions = ["fsn1", "nbg1"]"#);
     fn region_defaults_when_neither_field_set() {
         let cfg = parse(r#"hetzner_token = "x""#);
         assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
+    }
+
+    fn parse_project(toml: &str) -> ProjectConfig {
+        toml::from_str(toml).expect("parse project config")
+    }
+
+    #[test]
+    fn project_replaces_simple_fields() {
+        let mut cfg = parse(r#"hetzner_token = "x""#);
+        let proj = parse_project(r#"
+server_type = "ccx53"
+volume_gb = 50
+keep_alive_secs = 60
+"#);
+        cfg.merge_project(proj);
+        assert_eq!(cfg.server_type, "ccx53");
+        assert_eq!(cfg.volume_gb, 50);
+        assert_eq!(cfg.keep_alive_secs, 60);
+        // Untouched defaults survive.
+        assert_eq!(cfg.volume_keep_alive_secs, default_volume_keep_alive());
+    }
+
+    #[test]
+    fn project_replaces_regions_not_merges() {
+        let mut cfg = parse(r#"hetzner_token = "x"
+region = ["hel1", "fsn1"]"#);
+        let proj = parse_project(r#"region = "nbg1""#);
+        cfg.merge_project(proj);
+        // Replace, not extend — a project saying "I want nbg1" doesn't
+        // mean "and also keep all the global fallbacks I never asked
+        // for". The whole list is the project's intent.
+        assert_eq!(cfg.region, vec!["nbg1".to_string()]);
+    }
+
+    #[test]
+    fn project_forward_env_is_additive_and_deduped() {
+        let mut cfg = parse(r#"hetzner_token = "x"
+forward_env = ["RUST_LOG", "RUST_BACKTRACE"]"#);
+        let proj = parse_project(r#"forward_env = ["DATABASE_URL", "RUST_LOG"]"#);
+        cfg.merge_project(proj);
+        // Global ordering preserved; project-only entries appended;
+        // RUST_LOG appears once even though it's in both lists.
+        assert_eq!(
+            cfg.forward_env,
+            vec!["RUST_LOG", "RUST_BACKTRACE", "DATABASE_URL"]
+        );
+    }
+
+    #[test]
+    fn project_unset_fields_dont_clobber_global() {
+        let mut cfg = parse(r#"hetzner_token = "x"
+server_type = "ccx63"
+volume_gb = 200"#);
+        // Empty project file — should be a no-op.
+        cfg.merge_project(parse_project(""));
+        assert_eq!(cfg.server_type, "ccx63");
+        assert_eq!(cfg.volume_gb, 200);
+    }
+
+    #[test]
+    fn project_token_is_caught_at_deserialize() {
+        // The deserializer accepts `hetzner_token` so we can produce a
+        // targeted error in load_for_workspace; the parsed struct
+        // surfaces it as Some(_).
+        let proj = parse_project(r#"hetzner_token = "leaked""#);
+        assert_eq!(proj.hetzner_token.as_deref(), Some("leaked"));
+    }
+
+    #[test]
+    fn project_unknown_field_fails_to_parse() {
+        // deny_unknown_fields keeps typos honest.
+        let result: Result<ProjectConfig, _> =
+            toml::from_str(r#"servr_type = "ccx53""#);
+        assert!(result.is_err(), "expected typo to fail");
     }
 
     #[test]

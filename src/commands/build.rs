@@ -33,6 +33,12 @@ pub struct BuildArgs {
     /// where you'll re-run `cargo burst test` anyway).
     #[arg(long)]
     pub no_fetch: bool,
+    /// Forward an environment variable to the remote cargo invocation.
+    /// `NAME` forwards the local value of `$NAME`; `NAME=value` sets
+    /// it verbatim. Repeatable. Per-run `--env` overrides the
+    /// `forward_env` config field on a name conflict.
+    #[arg(long = "env", value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
     /// Args forwarded verbatim to `cargo` on the remote. Defaults to
     /// `["build"]` when none are supplied.
     #[arg(last = true)]
@@ -49,6 +55,7 @@ pub async fn run(args: BuildArgs) -> Result<()> {
         keep_alive: args.keep_alive,
         yes: args.yes,
         no_reap: args.no_reap,
+        cli_env: args.env.clone(),
     };
 
     let no_fetch = args.no_fetch;

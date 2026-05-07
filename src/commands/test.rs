@@ -52,6 +52,12 @@ pub struct TestArgs {
     /// so `--no-doctests` is ignored under this mode.
     #[arg(long, conflicts_with = "no_doctests")]
     pub cargo_test: bool,
+    /// Forward an environment variable to the remote test runner.
+    /// `NAME` forwards the local value of `$NAME`; `NAME=value` sets
+    /// it verbatim. Repeatable. Per-run `--env` overrides the
+    /// `forward_env` config field on a name conflict.
+    #[arg(long = "env", value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
     /// Args forwarded verbatim to the test runner on the remote.
     #[arg(last = true)]
     pub cargo_args: Vec<String>,
@@ -62,6 +68,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
         keep_alive: args.keep_alive,
         yes: args.yes,
         no_reap: args.no_reap,
+        cli_env: args.env.clone(),
     };
 
     let cargo_args = args.cargo_args.clone();

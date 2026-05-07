@@ -13,6 +13,7 @@ use anyhow::Result;
 
 use crate::config::{Config, State};
 use crate::hcloud::HCloud;
+use crate::project::ProjectKey;
 use crate::ssh;
 
 /// Connection-string text we print alongside each DB's up/down state.
@@ -26,12 +27,31 @@ const DB_SERVICES: &[(&str, &str)] = &[
 ];
 
 pub async fn run() -> Result<()> {
-    let cfg = Config::load()?;
+    // Detect the workspace (if any) so the printed config reflects
+    // whatever `<workspace>/.config/cargo-burst.toml` overrides
+    // — running `cargo burst status` from inside a project should
+    // show the *effective* config for that project, not just the
+    // global defaults. Outside any cargo workspace we silently fall
+    // back to global-only.
+    let cwd = std::env::current_dir()?;
+    let workspace_root = ProjectKey::discover(&cwd)
+        .ok()
+        .map(|p| p.workspace_root);
+    let cfg = Config::load_for_workspace(workspace_root.as_deref())?;
     let state = State::load()?;
     let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
 
+    if let Some(root) = workspace_root.as_deref() {
+        let proj = crate::config::project_config_path(root);
+        if proj.exists() {
+            println!("project cfg:  {} (applied)", proj.display());
+        }
+    }
     println!("regions:      {}", cfg.region_preference().join(", "));
     println!("server type:  {}", cfg.server_type);
+    if !cfg.forward_env.is_empty() {
+        println!("forward_env:  {}", cfg.forward_env.join(", "));
+    }
     println!();
 
     match state.image_id {

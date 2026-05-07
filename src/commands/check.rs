@@ -27,6 +27,12 @@ pub struct CheckArgs {
     /// alive indefinitely until you run `cargo burst down`.
     #[arg(long)]
     pub no_reap: bool,
+    /// Forward an environment variable to the remote cargo invocation.
+    /// `NAME` forwards the local value of `$NAME`; `NAME=value` sets
+    /// it verbatim. Repeatable. Per-run `--env` overrides the
+    /// `forward_env` config field on a name conflict.
+    #[arg(long = "env", value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
     /// Args forwarded verbatim to `cargo` on the remote. Defaults to
     /// `["check"]` when none are supplied.
     #[arg(last = true)]
@@ -38,6 +44,7 @@ pub async fn run(args: CheckArgs) -> Result<()> {
         keep_alive: args.keep_alive,
         yes: args.yes,
         no_reap: args.no_reap,
+        cli_env: args.env.clone(),
     };
     remote::run_cargo_passthrough(opts, "Check", "check", args.cargo_args).await
 }

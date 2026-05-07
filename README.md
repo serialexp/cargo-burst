@@ -89,6 +89,62 @@ Common flags on every run-subcommand:
 - `--no-reap` — leave the server (and volume) alive indefinitely
 - `--no-fetch` — skip artifact fetch (build, bench)
 - `--yes` — skip the first-run "apply suggested rsync excludes?" prompt
+- `--env VAR[=VALUE]` — forward an environment variable to the remote
+  cargo invocation. `--env RUST_LOG` forwards your local `$RUST_LOG`;
+  `--env DATABASE_URL=postgres://…` sets it verbatim. Repeatable.
+
+## Forwarding environment variables
+
+By default cargo-burst exports nothing from your local shell — only
+its own internal pins (`CARGO_TARGET_DIR`, `SCCACHE_DIR`, `PATH`) reach
+the remote. That's deliberate: copying the whole environment would
+ship Hetzner tokens, host-only paths, and locale settings to a
+machine that has no use for them.
+
+Two opt-in mechanisms forward exactly what you want:
+
+**Per-run flag.** `--env` on every run-subcommand:
+
+```sh
+cargo burst test --env RUST_LOG --env RUST_BACKTRACE=1
+cargo burst bench --env DATABASE_URL=postgres://postgres@localhost:5432/test
+```
+
+**Standing config.** `forward_env` in either config file is a list of
+names whose *current local values* get exported on every run. Names
+unset locally are silently skipped, so it's fine to keep `RUST_LOG`
+in the list across runs where you didn't set it.
+
+```toml
+# ~/.config/cargo-burst/config.toml — applies to every project
+forward_env = ["RUST_LOG", "RUST_BACKTRACE", "RUSTFLAGS"]
+```
+
+**Per-project overrides.** Drop `<workspace>/.config/cargo-burst.toml`
+into a project to override or extend the global config:
+
+```toml
+# my-project/.config/cargo-burst.toml — committed; team-shared
+server_type = "ccx53"
+volume_gb   = 50
+forward_env = ["DATABASE_URL", "RUN_BIG_TESTS"]
+```
+
+Layering rules:
+
+- Project file overrides any global field except `hetzner_token`
+  (refused — tokens belong only in the per-user global config).
+- `forward_env` is **additive** across global → project → CLI;
+  everything else is **replace**. Per-run `--env` always wins on a
+  name conflict.
+- Names like `PATH`, `HOME`, `CARGO_TARGET_DIR` are always refused
+  with a warning — forwarding them would silently break the remote.
+
+The project file goes in `<workspace>/.config/cargo-burst.toml`
+rather than `<workspace>/.cargo-burst.toml` — same convention
+[cargo-nextest](https://nexte.st) uses for its project config, so
+multiple Rust tools can share one `.config/` dir instead of each
+spawning a top-level dotfile.
 
 ## Database services for integration tests
 
