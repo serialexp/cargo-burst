@@ -83,8 +83,9 @@ enum Command {
     /// command timings, and the wall-time split between provision /
     /// sync / cargo. Useful for answering "is burst worth it?".
     Audit(commands::audit::AuditArgs),
-    /// Delete the running server now (volume is preserved).
-    Down,
+    /// Delete the running server now. Project volumes are preserved by
+    /// default; pass `--with-volumes` to delete those too (clean slate).
+    Down(commands::down::DownArgs),
     /// Write usage instructions for cargo-burst into `~/.claude/CLAUDE.md`
     /// so Claude Code knows when and how to reach for it. Idempotent —
     /// re-run after upgrading to refresh the instructions block.
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
         Command::Bench(args) => commands::bench::run(args).await,
         Command::Status => commands::status::run().await,
         Command::Audit(args) => commands::audit::run(args).await,
-        Command::Down => commands::down::run().await,
+        Command::Down(args) => commands::down::run(args).await,
         Command::Install => commands::install::run().await,
         Command::ReapServer(args) => commands::reap::run_server(args).await,
         Command::ReapVolume(args) => commands::reap::run_volume(args).await,

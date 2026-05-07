@@ -73,7 +73,7 @@ cargo burst bench                  # criterion HTML reports rsynced back
 | `cargo burst bench [args]`   | `cargo bench [args]`                     | `target/criterion/` (recursive, if present)   |
 | `cargo burst status`         | —                                        | shows what's provisioned + last-used per project |
 | `cargo burst audit`          | —                                        | summarises the lifecycle log (sessions, cold-vs-warm timings, wall-time split, per-verb means; pass `--rate EUR_PER_HOUR` for cost) |
-| `cargo burst down`           | deletes the running server               | (volume kept until volume reaper fires)       |
+| `cargo burst down`           | deletes the running server (volumes kept) | (use `--with-volumes` to delete all volumes too) |
 | `cargo burst image build`    | bakes a fresh base image                 | —                                             |
 
 Args after `--` go to cargo verbatim:
