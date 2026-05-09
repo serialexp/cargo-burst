@@ -154,8 +154,10 @@ chmod 0640 "${PG_CONF_DIR}/pg_hba.conf"
 #   shared_buffers   = 25% of RAM        → 48 GB
 #   effective_cache  = 75% of RAM        → 144 GB (planner hint)
 #   maintenance_work = 2 GB (capped — bigger doesn't help VACUUM/CREATE INDEX much past this)
-#   work_mem         = 64 MB per sort/hash node — generous because we cap connections at 500
-#                      and most test queries don't fan out to many sort nodes
+#   work_mem         = 64 MB per sort/hash node — generous, but with
+#                      max_connections=1000 the theoretical worst-case
+#                      footprint is still only ~64 GB on top of
+#                      shared_buffers, well inside 192 GB
 #
 # Parallelism: 48 cores, but a single test query rarely benefits from
 # more than ~4-way parallel scan. Keep workers_per_gather modest so a
@@ -184,7 +186,7 @@ cat > "${PG_CONF_DIR}/conf.d/99-cargo-burst.conf" <<'PGCONF'
 # whose data you care about — fsync is off.
 
 # ── Connections ──
-max_connections = 500
+max_connections = 1000
 
 # ── Memory ──
 shared_buffers = 48GB
