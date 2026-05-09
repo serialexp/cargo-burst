@@ -142,6 +142,85 @@ host    all             all             ::1/128                 trust
 PGHBA
 chown postgres:postgres "${PG_CONF_DIR}/pg_hba.conf"
 chmod 0640 "${PG_CONF_DIR}/pg_hba.conf"
+
+# Tune postgres for the CCX63 box (48 dedicated vCPUs, 192 GB RAM) and
+# for the integration-test workload it actually serves: short-lived
+# connections, lots of CREATE/DROP DATABASE, write-heavy fixtures, and
+# absolutely zero need for durability — every byte gets thrown away
+# when the VM is reaped. The `99-cargo-burst.conf` name sorts last so
+# our settings win against anything Ubuntu ships in conf.d.
+#
+# Memory: classic pgtune ratios for an OLTP-ish workload.
+#   shared_buffers   = 25% of RAM        → 48 GB
+#   effective_cache  = 75% of RAM        → 144 GB (planner hint)
+#   maintenance_work = 2 GB (capped — bigger doesn't help VACUUM/CREATE INDEX much past this)
+#   work_mem         = 64 MB per sort/hash node — generous because we cap connections at 500
+#                      and most test queries don't fan out to many sort nodes
+#
+# Parallelism: 48 cores, but a single test query rarely benefits from
+# more than ~4-way parallel scan. Keep workers_per_gather modest so a
+# burst of parallel tests doesn't have every backend stealing all the
+# workers at once.
+#
+# WAL & durability: this is the big test-suite speedup.
+#   fsync=off + synchronous_commit=off + full_page_writes=off turns
+#   COMMIT into a near-no-op. UNSAFE on real data; perfect for an
+#   ephemeral build VM. checkpoint settings are still tuned because
+#   long-running suites still benefit from infrequent checkpoints.
+#
+# SSD assumptions: random_page_cost=1.1 and high effective_io_concurrency
+# match Hetzner's NVMe-backed local disk.
+echo "[cargo-burst] writing tuned postgres config (48c/192GB, durability off)"
+mkdir -p "${PG_CONF_DIR}/conf.d"
+# Debian/Ubuntu ship postgresql.conf with `include_dir = 'conf.d'` enabled
+# already, but make it explicit so this works even if a future package
+# revision changes the default.
+if ! grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" "${PG_CONF_DIR}/postgresql.conf"; then
+    echo "include_dir = 'conf.d'  # added by cargo-burst bake" >> "${PG_CONF_DIR}/postgresql.conf"
+fi
+cat > "${PG_CONF_DIR}/conf.d/99-cargo-burst.conf" <<'PGCONF'
+# Written by cargo-burst bake. Tuned for 48 vCPU / 192 GB RAM on an
+# ephemeral integration-test VM. DO NOT use these settings on a box
+# whose data you care about — fsync is off.
+
+# ── Connections ──
+max_connections = 500
+
+# ── Memory ──
+shared_buffers = 48GB
+effective_cache_size = 144GB
+maintenance_work_mem = 2GB
+work_mem = 64MB
+huge_pages = try
+
+# ── Parallelism ──
+max_worker_processes = 48
+max_parallel_workers = 48
+max_parallel_workers_per_gather = 4
+max_parallel_maintenance_workers = 4
+
+# ── Planner / IO (NVMe local disk) ──
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+# ── WAL / checkpoints ──
+wal_buffers = 16MB
+min_wal_size = 1GB
+max_wal_size = 8GB
+checkpoint_completion_target = 0.9
+checkpoint_timeout = 15min
+
+# ── Durability OFF — ephemeral test VM only ──
+# These three together make COMMIT roughly free. If the VM crashes
+# mid-test the entire database cluster may be unrecoverable; that is
+# fine because every reaped server starts with an empty cluster.
+fsync = off
+synchronous_commit = off
+full_page_writes = off
+PGCONF
+chown postgres:postgres "${PG_CONF_DIR}/conf.d/99-cargo-burst.conf"
+chmod 0640 "${PG_CONF_DIR}/conf.d/99-cargo-burst.conf"
+
 systemctl enable postgresql
 
 # ── MySQL ──
