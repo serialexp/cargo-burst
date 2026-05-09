@@ -67,7 +67,7 @@ cargo burst bench                  # criterion HTML reports rsynced back
 | Command                      | What it runs on the remote               | Fetches back                                  |
 |------------------------------|------------------------------------------|-----------------------------------------------|
 | `cargo burst build [args]`   | `cargo build [args]`                     | top-level files in `target/<profile>/`        |
-| `cargo burst test [args]`    | `cargo nextest run` + `cargo test --doc` | nothing                                       |
+| `cargo burst test [args]`    | `cargo nextest run` + `cargo test --doc` (doctests auto-skipped if args contain `--test`/`--bin`/`--example`/`--bench` or their plurals) | nothing                                       |
 | `cargo burst check [args]`   | `cargo check [args]`                     | nothing                                       |
 | `cargo burst clippy [args]`  | `cargo clippy [args]`                    | nothing                                       |
 | `cargo burst bench [args]`   | `cargo bench [args]`                     | `target/criterion/` (recursive, if present)   |

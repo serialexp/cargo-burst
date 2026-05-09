@@ -119,6 +119,21 @@ pub async fn run(args: TestArgs) -> Result<()> {
             return Ok(());
         }
 
+        // Auto-skip doctests when the user passed cargo target-selection
+        // flags that are mutually exclusive with `--doc`. Without this the
+        // nextest pass succeeds, then the doctest pass blows up with
+        //   error: the argument '--doc' cannot be used with '--test <NAME>'
+        // and the whole run exits non-zero despite every test passing.
+        // `--lib`, `-p`, `--workspace`, `--features`, etc. are compatible
+        // with `--doc` so they don't trigger this.
+        if let Some(flag) = doc_incompatible_filter(&cargo_args) {
+            tracing::info!(
+                filter = %flag,
+                "test filter incompatible with `cargo test --doc`; skipping doctests"
+            );
+            return Ok(());
+        }
+
         // `cargo test --doc` errors out with `no library targets found in
         // package` (exit 101) for workspaces that consist only of binary
         // crates. nextest already covered everything that exists in that
@@ -160,6 +175,32 @@ pub async fn run(args: TestArgs) -> Result<()> {
         Ok(())
     })
     .await
+}
+
+/// Return the first cargo target-selection flag in `args` that is
+/// mutually exclusive with `cargo test --doc`, or `None` if no such
+/// flag is present. These are the target-picking flags — picking a
+/// specific bin/test/example/bench excludes the doctest target — as
+/// opposed to package/feature filters (`-p`, `--workspace`, `--lib`,
+/// `--features`, etc.) which compose fine with `--doc`.
+///
+/// Both spaced (`--test foo`) and `=`-joined (`--test=foo`) forms are
+/// recognized. Bare `--test`/`--bin`/etc. with no value would be a
+/// cargo error anyway, so we still flag it (cargo will report the
+/// real error first).
+fn doc_incompatible_filter(args: &[String]) -> Option<&str> {
+    const FLAGS: &[&str] = &[
+        "--test", "--bin", "--example", "--bench",
+        "--tests", "--bins", "--examples", "--benches",
+    ];
+    for arg in args {
+        for f in FLAGS {
+            if arg == f || arg.starts_with(&format!("{f}=")) {
+                return Some(f);
+            }
+        }
+    }
+    None
 }
 
 /// Return true if any package in the workspace exposes a doctest-eligible
@@ -236,6 +277,33 @@ mod tests {
         };
         let name = if is_lib { "lib.rs" } else { "main.rs" };
         fs::write(dir.join("src").join(name), body).unwrap();
+    }
+
+    #[test]
+    fn doc_incompatible_detects_target_flags() {
+        let s = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(doc_incompatible_filter(&s(&["--test", "foo"])), Some("--test"));
+        assert_eq!(doc_incompatible_filter(&s(&["--test=foo"])), Some("--test"));
+        assert_eq!(doc_incompatible_filter(&s(&["--bin", "x"])), Some("--bin"));
+        assert_eq!(doc_incompatible_filter(&s(&["--example=e"])), Some("--example"));
+        assert_eq!(doc_incompatible_filter(&s(&["--bench", "b"])), Some("--bench"));
+        assert_eq!(doc_incompatible_filter(&s(&["--tests"])), Some("--tests"));
+        assert_eq!(doc_incompatible_filter(&s(&["--bins"])), Some("--bins"));
+    }
+
+    #[test]
+    fn doc_incompatible_ignores_compatible_flags() {
+        let s = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(doc_incompatible_filter(&s(&[])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["--release"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["-p", "foo"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["--package=foo"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["--workspace"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["--lib"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["--features", "a,b"])), None);
+        assert_eq!(doc_incompatible_filter(&s(&["my_test_name"])), None);
+        // Substring of a flag name shouldn't match (e.g. --tests-something is fake but illustrates the prefix check)
+        assert_eq!(doc_incompatible_filter(&s(&["--testsuite"])), None);
     }
 
     #[test]
