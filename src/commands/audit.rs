@@ -67,7 +67,11 @@ pub async fn run(args: AuditArgs) -> Result<()> {
     }
 
     let stats = compute(&events);
-    print_report(&stats, &path, events.len(), skipped, args.rate);
+    // Best-effort load of current keep_alive_secs for the what-if
+    // model. If config can't be loaded (token missing, file missing,
+    // unreadable), the report drops the what-if section gracefully.
+    let current_keep_alive = crate::config::Config::load().ok().map(|c| c.keep_alive_secs);
+    print_report(&stats, &path, events.len(), skipped, args.rate, current_keep_alive);
     Ok(())
 }
 
@@ -143,6 +147,12 @@ struct SessionStats {
 /// then immediately needing the server back.
 ///
 /// Buckets are inclusive (≤). A 0-second gap counts in all three.
+///
+/// `reap_*` fields are restricted to terminations whose reason is
+/// `Reap`, because the what-if simulator only models the reaper:
+/// `down` is user-driven (a longer keep-alive doesn't undo `cargo
+/// burst down`), and `stale`/`orphaned` are bookkeeping cleanups that
+/// happen independently of the keep-alive timer.
 #[derive(Default, Debug)]
 struct ChurnStats {
     /// Total `ServerTerminated → next ServerProvisioned` pairs we saw.
@@ -159,6 +169,15 @@ struct ChurnStats {
     /// Sum of gaps for the bucketed (≤ 60 min) pairs, used to compute
     /// the mean gap of the close-churn population.
     sum_gap_secs_within_60m: f64,
+
+    /// Reap-only pair total — the population the what-if model
+    /// applies to. Down/Stale/Orphaned pairs aren't modeled.
+    reap_total_pairs: u32,
+    /// Reap-only counts and gap-sums per bucket. `[10m, 30m, 60m]`.
+    /// gap-sums are seconds, used to derive extra runtime under a
+    /// hypothetical larger keep-alive.
+    reap_within: [u32; 3],
+    reap_within_sum_gap_secs: [f64; 3],
 }
 
 #[derive(Default, Debug)]
@@ -196,6 +215,18 @@ fn compute(events: &[Event]) -> Stats {
                         }
                         if gap <= 10.0 * 60.0 {
                             s.churn.within_10m = s.churn.within_10m.saturating_add(1);
+                        }
+                    }
+                    // Reap-only what-if accounting.
+                    if reason == TerminationReason::Reap {
+                        s.churn.reap_total_pairs = s.churn.reap_total_pairs.saturating_add(1);
+                        let buckets = [10.0 * 60.0, 30.0 * 60.0, 60.0 * 60.0];
+                        for (i, &limit) in buckets.iter().enumerate() {
+                            if gap <= limit {
+                                s.churn.reap_within[i] =
+                                    s.churn.reap_within[i].saturating_add(1);
+                                s.churn.reap_within_sum_gap_secs[i] += gap;
+                            }
                         }
                     }
                 }
@@ -286,7 +317,80 @@ fn cost_eur(total_lifetime_secs: f64, rate_per_hour: f64) -> f64 {
     (total_lifetime_secs / 3600.0) * rate_per_hour
 }
 
-fn print_report(s: &Stats, path: &Path, raw_events: usize, skipped: usize, rate: Option<f64>) {
+/// One row of the keep-alive what-if model: "if we'd had keep_alive=T
+/// instead of K, what would have happened across all the historical
+/// reap→reprovision pairs?"
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WhatIf {
+    proposed_keep_alive_secs: f64,
+    /// Reaps that wouldn't have happened — the next use landed inside
+    /// the new keep-alive window, so the server would have stayed up.
+    saved_provisions: u32,
+    /// Wall-clock saved across those saved provisions, computed as
+    /// `saved × (mean_cold_provision - mean_warm_provision)`. Falls
+    /// back to 0 if either phase has no samples or the warm mean is
+    /// somehow ≥ the cold one (shouldn't happen with real data).
+    wall_saved_secs: f64,
+    /// Extra server-uptime under the proposal:
+    ///   - For each saved pair: gap_i - K (server now lives gap_i
+    ///     idle seconds instead of K).
+    ///   - For each reap pair the proposal STILL reaps (gap_i > T):
+    ///     T - K (reaper fires later).
+    /// Values < 0 are clamped to 0 — the proposal is a "longer
+    /// keep-alive" so by construction T ≥ K.
+    extra_runtime_secs: f64,
+}
+
+/// Pure what-if computation: see `WhatIf`. `bucket_idx` selects
+/// 0=10m, 1=30m, 2=60m from the per-bucket reap stats. Returns `None`
+/// when the proposal isn't actually a relaxation (T ≤ K) — there's
+/// nothing useful to say in that direction.
+fn what_if_keep_alive(
+    churn: &ChurnStats,
+    cold: &PhaseStats,
+    warm: &PhaseStats,
+    current_keep_alive_secs: f64,
+    bucket_idx: usize,
+) -> Option<WhatIf> {
+    let t_secs = match bucket_idx {
+        0 => 10.0 * 60.0,
+        1 => 30.0 * 60.0,
+        2 => 60.0 * 60.0,
+        _ => return None,
+    };
+    if t_secs <= current_keep_alive_secs {
+        return None;
+    }
+    let k = current_keep_alive_secs;
+    let saved = churn.reap_within[bucket_idx];
+    let saved_sum_gap = churn.reap_within_sum_gap_secs[bucket_idx];
+    let unsaved = churn.reap_total_pairs.saturating_sub(saved);
+
+    let provision_delta = (cold.mean_provision() - warm.mean_provision()).max(0.0);
+    let wall_saved = saved as f64 * provision_delta;
+
+    // Saved pairs: server stays alive for the whole gap instead of
+    // reaping at K, so each contributes (gap - K).
+    let saved_extra = (saved_sum_gap - saved as f64 * k).max(0.0);
+    // Unsaved pairs: still reap, but later — at T instead of K.
+    let unsaved_extra = unsaved as f64 * (t_secs - k);
+
+    Some(WhatIf {
+        proposed_keep_alive_secs: t_secs,
+        saved_provisions: saved,
+        wall_saved_secs: wall_saved,
+        extra_runtime_secs: saved_extra + unsaved_extra,
+    })
+}
+
+fn print_report(
+    s: &Stats,
+    path: &Path,
+    raw_events: usize,
+    skipped: usize,
+    rate: Option<f64>,
+    current_keep_alive_secs: Option<u64>,
+) {
     println!("cargo burst audit — {}", path.display());
     if skipped == 0 {
         println!("  ({raw_events} events)");
@@ -358,6 +462,85 @@ fn print_report(s: &Stats, path: &Path, raw_events: usize, skipped: usize, rate:
                     .collect();
                 println!("  ≤60m by termination reason: {}", parts.join("  "));
             }
+        }
+        println!();
+    }
+
+    // ── What-if: longer keep-alive ─────────────────────────────────
+    // Only worth emitting if (a) we know the current K, (b) there's at
+    // least one Reap pair to model against, and (c) we have both cold
+    // and warm samples so the wall-clock-saved column is meaningful.
+    if let Some(current_k) = current_keep_alive_secs
+        && s.churn.reap_total_pairs > 0
+        && s.cold.count > 0
+        && s.warm.count > 0
+    {
+        let k_secs = current_k as f64;
+        println!("Keep-alive what-if (current keep_alive_secs = {current_k})");
+        println!(
+            "  Models only Reap pairs ({} of {} total churn pairs); Down/Stale/Orphaned",
+            s.churn.reap_total_pairs, s.churn.total_pairs,
+        );
+        println!("  terminations would happen identically under any keep-alive.");
+        println!();
+        let header = if rate.is_some() {
+            format!(
+                "  {:<10} {:>8}  {:>11}  {:>13}  {:>10}  {:>10}",
+                "proposed", "saved", "wall saved", "extra runtime", "extra €", "€/h saved"
+            )
+        } else {
+            format!(
+                "  {:<10} {:>8}  {:>11}  {:>13}",
+                "proposed", "saved", "wall saved", "extra runtime"
+            )
+        };
+        println!("{header}");
+        let mut any = false;
+        for (idx, label) in [(0, "10 min"), (1, "30 min"), (2, "60 min")] {
+            let Some(w) = what_if_keep_alive(&s.churn, &s.cold, &s.warm, k_secs, idx) else {
+                continue;
+            };
+            any = true;
+            if let Some(rate) = rate {
+                let extra_eur = cost_eur(w.extra_runtime_secs, rate);
+                // Wall-clock saved per euro spent — converted to "€/h
+                // of saved wall time". Higher = better deal. Falls
+                // back to "—" when extra cost is zero (free win).
+                let eff = if extra_eur > 0.0 {
+                    let saved_h = w.wall_saved_secs / 3600.0;
+                    if saved_h > 0.0 {
+                        format!("€{:.4}", extra_eur / saved_h)
+                    } else {
+                        "—".to_string()
+                    }
+                } else if w.wall_saved_secs > 0.0 {
+                    "free".to_string()
+                } else {
+                    "—".to_string()
+                };
+                println!(
+                    "  {:<10} {:>8}  {:>11}  {:>13}  {:>10}  {:>10}",
+                    label,
+                    w.saved_provisions,
+                    fmt_secs(w.wall_saved_secs),
+                    fmt_secs(w.extra_runtime_secs),
+                    format!("€{extra_eur:.4}"),
+                    eff,
+                );
+            } else {
+                println!(
+                    "  {:<10} {:>8}  {:>11}  {:>13}",
+                    label,
+                    w.saved_provisions,
+                    fmt_secs(w.wall_saved_secs),
+                    fmt_secs(w.extra_runtime_secs),
+                );
+            }
+        }
+        if !any {
+            println!(
+                "  (current keep_alive_secs of {current_k}s already covers all the modeled buckets)"
+            );
         }
         println!();
     }
@@ -627,6 +810,90 @@ mod tests {
         let evs = vec![prov_at("2026-05-06T00:00:00Z")];
         let s = compute(&evs);
         assert_eq!(s.churn.total_pairs, 0);
+    }
+
+    fn phase(count: u32, p: f64) -> PhaseStats {
+        // Synthesize a PhaseStats whose mean_provision is `p`.
+        PhaseStats {
+            count,
+            sum_provision: p * count as f64,
+            sum_sync: 0.0,
+            sum_cargo: 0.0,
+        }
+    }
+
+    #[test]
+    fn what_if_skipped_when_proposal_not_a_relaxation() {
+        let churn = ChurnStats {
+            reap_total_pairs: 5,
+            reap_within: [3, 4, 5],
+            reap_within_sum_gap_secs: [600.0, 1200.0, 1800.0],
+            ..Default::default()
+        };
+        let cold = phase(1, 30.0);
+        let warm = phase(1, 3.0);
+        // Current K = 15 min — 10m bucket isn't a relaxation, return None.
+        assert!(what_if_keep_alive(&churn, &cold, &warm, 15.0 * 60.0, 0).is_none());
+        // 30m and 60m still are.
+        assert!(what_if_keep_alive(&churn, &cold, &warm, 15.0 * 60.0, 1).is_some());
+        assert!(what_if_keep_alive(&churn, &cold, &warm, 15.0 * 60.0, 2).is_some());
+    }
+
+    #[test]
+    fn what_if_savings_and_runtime_math() {
+        // Current K = 5 min (300s). Three reap pairs, gaps 6m, 20m, 50m.
+        // For T=10m: only the 6m pair is "saved". Other two reap at 10m
+        //            instead of 5m → +5m each.
+        //            Saved-pair extra runtime = 6m - 5m = 1m.
+        //            Total extra = 1m + 2 × 5m = 11m.
+        //            Saved provisions = 1; wall_saved = 1 × (30s - 3s) = 27s.
+        let churn = ChurnStats {
+            reap_total_pairs: 3,
+            reap_within: [1, 2, 3],
+            reap_within_sum_gap_secs: [6.0 * 60.0, (6.0 + 20.0) * 60.0, (6.0 + 20.0 + 50.0) * 60.0],
+            ..Default::default()
+        };
+        let cold = phase(1, 30.0);
+        let warm = phase(1, 3.0);
+        let k = 5.0 * 60.0;
+
+        let w10 = what_if_keep_alive(&churn, &cold, &warm, k, 0).unwrap();
+        assert_eq!(w10.saved_provisions, 1);
+        assert!((w10.wall_saved_secs - 27.0).abs() < 1e-6);
+        assert!((w10.extra_runtime_secs - 11.0 * 60.0).abs() < 1e-6);
+
+        // T=30m: pairs 6m and 20m are saved (gaps 6m+20m=26m of idle).
+        //   saved_extra = 26m - 2 × 5m = 16m
+        //   unsaved (the 50m pair) = 30m - 5m = 25m
+        //   total extra = 16m + 25m = 41m
+        //   wall saved = 2 × 27 = 54s
+        let w30 = what_if_keep_alive(&churn, &cold, &warm, k, 1).unwrap();
+        assert_eq!(w30.saved_provisions, 2);
+        assert!((w30.wall_saved_secs - 54.0).abs() < 1e-6);
+        assert!((w30.extra_runtime_secs - 41.0 * 60.0).abs() < 1e-6);
+
+        // T=60m: all three saved, gap sum 76m, saved_extra = 76 - 3×5 = 61m,
+        //   no unsaved → 61m total, wall saved = 3 × 27 = 81s.
+        let w60 = what_if_keep_alive(&churn, &cold, &warm, k, 2).unwrap();
+        assert_eq!(w60.saved_provisions, 3);
+        assert!((w60.wall_saved_secs - 81.0).abs() < 1e-6);
+        assert!((w60.extra_runtime_secs - 61.0 * 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn what_if_clamps_provision_delta_at_zero() {
+        // Pathological: warm provision somehow ≥ cold (no real run will
+        // produce this, but we mustn't emit negative wall_saved).
+        let churn = ChurnStats {
+            reap_total_pairs: 1,
+            reap_within: [1, 1, 1],
+            reap_within_sum_gap_secs: [400.0, 400.0, 400.0],
+            ..Default::default()
+        };
+        let cold = phase(1, 5.0);
+        let warm = phase(1, 10.0);
+        let w = what_if_keep_alive(&churn, &cold, &warm, 300.0, 0).unwrap();
+        assert_eq!(w.wall_saved_secs, 0.0);
     }
 
     #[test]
