@@ -86,6 +86,21 @@ pub struct Config {
     /// leak host-specific state.
     #[serde(default)]
     pub forward_env: Vec<String>,
+    /// Patterns added to the rsync exclude list on top of cargo-burst's
+    /// built-in defaults (see `ssh::DEFAULT_EXCLUDES`). Typically
+    /// project-scoped (set in `<workspace>/.config/cargo-burst.toml`)
+    /// rather than global, but accepted at the global level too for
+    /// patterns the user always wants excluded everywhere.
+    #[serde(default)]
+    pub extra_excludes: Vec<String>,
+    /// Default-exclude patterns to NOT apply (as exact-match strings
+    /// against `ssh::DEFAULT_EXCLUDES`). The common project-scoped
+    /// case is `[".git/"]` for repos whose binary needs the working
+    /// tree to be a real git checkout. Like `extra_excludes`, accepted
+    /// at the global level too — set globally if you ALWAYS want a
+    /// particular default off.
+    #[serde(default)]
+    pub unexclude: Vec<String>,
 }
 
 /// All-optional patch deserialised from
@@ -124,6 +139,22 @@ pub struct ProjectConfig {
     /// global ordering, then project ordering for new entries).
     #[serde(default)]
     pub forward_env: Option<Vec<String>>,
+    /// Patterns added to the rsync exclude list on top of cargo-burst's
+    /// built-in defaults. Useful for project-specific clutter that
+    /// shouldn't reach the remote (large fixtures, local-only outputs).
+    /// Composed after `unexclude`, so an entry here can re-add an
+    /// extension of something `unexclude` removed (rare, but possible).
+    #[serde(default)]
+    pub extra_excludes: Option<Vec<String>>,
+    /// Built-in default-exclude patterns to NOT apply for this project.
+    /// Pattern matching is by exact string equality against
+    /// `ssh::DEFAULT_EXCLUDES`. Most common use: `unexclude = [".git/"]`
+    /// when a binary needs the repo to be present on the remote (build
+    /// stamping, git-introspecting code, scripts that shell out to
+    /// `git`). Entries that don't match any default are warned about
+    /// once at sync time but not fatal — typos shouldn't block builds.
+    #[serde(default)]
+    pub unexclude: Option<Vec<String>>,
 }
 
 fn default_region() -> Vec<String> { vec!["hel1".into()] }
@@ -399,6 +430,24 @@ impl Config {
                 }
             }
         }
+        // Excludes: both fields are additive across global → project,
+        // deduped. Replace semantics would be surprising here — a
+        // project specifying `extra_excludes = ["foo"]` shouldn't
+        // silently undo a global pattern.
+        if let Some(extra) = project.extra_excludes {
+            for pat in extra {
+                if !self.extra_excludes.iter().any(|p| p == &pat) {
+                    self.extra_excludes.push(pat);
+                }
+            }
+        }
+        if let Some(extra) = project.unexclude {
+            for pat in extra {
+                if !self.unexclude.iter().any(|p| p == &pat) {
+                    self.unexclude.push(pat);
+                }
+            }
+        }
     }
 
     /// Ordered list of regions to try for server provisioning.
@@ -636,6 +685,32 @@ forward_env = ["RUST_LOG", "RUST_BACKTRACE"]"#);
             cfg.forward_env,
             vec!["RUST_LOG", "RUST_BACKTRACE", "DATABASE_URL"]
         );
+    }
+
+    #[test]
+    fn project_extra_excludes_are_additive_and_deduped() {
+        let mut cfg = parse(r#"hetzner_token = "x"
+extra_excludes = ["fixtures/large/"]"#);
+        let proj = parse_project(r#"extra_excludes = ["fixtures/large/", "*.bak"]"#);
+        cfg.merge_project(proj);
+        assert_eq!(cfg.extra_excludes, vec!["fixtures/large/", "*.bak"]);
+    }
+
+    #[test]
+    fn project_unexclude_is_additive_and_deduped() {
+        let mut cfg = parse(r#"hetzner_token = "x"
+unexclude = [".git/"]"#);
+        let proj = parse_project(r#"unexclude = [".git/", ".vscode/"]"#);
+        cfg.merge_project(proj);
+        assert_eq!(cfg.unexclude, vec![".git/", ".vscode/"]);
+    }
+
+    #[test]
+    fn project_unexclude_only_set_at_project_level_works() {
+        // No global unexclude, project adds one.
+        let mut cfg = parse(r#"hetzner_token = "x""#);
+        cfg.merge_project(parse_project(r#"unexclude = [".git/"]"#));
+        assert_eq!(cfg.unexclude, vec![".git/"]);
     }
 
     #[test]

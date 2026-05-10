@@ -167,7 +167,7 @@ where
         // it before provisioning means the user sees what's about to
         // be sync'd before any cloud resources are created — and lets
         // us bail early if they Ctrl-C at the prompt.
-        let extra_excludes = scan_and_confirm_excludes(&project, &mut state, opts.yes)?;
+        let extra_excludes = scan_and_confirm_excludes(&cfg, &project, &mut state, opts.yes)?;
 
         // Region-fallback path. We have to know the *server's* region
         // before creating/reusing a volume, because Hetzner volumes are
@@ -236,7 +236,13 @@ where
     // via --rsync-path. One less SSH round-trip per run.
     let remote_src = format!("/home/work/src/{}/", project.hash);
     let mount_script = render_mount_script(volume.id, &project.hash);
-    let extra: Vec<&str> = extra_excludes.iter().map(String::as_str).collect();
+    // Compose the full exclude list for rsync — defaults filtered by
+    // `unexclude`, plus `cfg.extra_excludes`, plus state-saved
+    // interactive extras. Same composition the size scanner used,
+    // so what got reported in the pre-sync summary is exactly what
+    // rsync will skip.
+    let merged_excludes = build_merged_excludes(&cfg, &extra_excludes);
+    let exclude_args: Vec<&str> = merged_excludes.iter().map(String::as_str).collect();
     let sync_start = Instant::now();
     tracing::info!(
         volume = volume.id,
@@ -257,7 +263,7 @@ where
         &ssh_key_path,
         &project.workspace_root,
         &remote_src,
-        &extra,
+        &exclude_args,
         Some(&remote_src),
     );
 
@@ -793,6 +799,7 @@ BURST_MOUNT
 // ── Exclude scan + first-run prompt ───────────────────────────────────
 
 fn scan_and_confirm_excludes(
+    cfg: &Config,
     project: &ProjectKey,
     state: &mut State,
     auto_yes: bool,
@@ -803,7 +810,7 @@ fn scan_and_confirm_excludes(
         .and_then(|p| p.excludes.clone());
     let mut user_excludes: Vec<String> = saved.clone().unwrap_or_default();
 
-    let merged = build_merged_excludes(&user_excludes);
+    let merged = build_merged_excludes(cfg, &user_excludes);
     let matcher = build_matcher(&project.workspace_root, &merged)?;
 
     let sizes = top_level_sizes(&project.workspace_root, &matcher)?;
@@ -872,10 +879,45 @@ fn scan_and_confirm_excludes(
     Ok(user_excludes)
 }
 
-fn build_merged_excludes(user: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = ssh::DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect();
-    v.extend(user.iter().cloned());
-    v
+/// Compose the final rsync exclude list:
+///
+///   1. `ssh::DEFAULT_EXCLUDES`, minus anything the user listed in
+///      `cfg.unexclude` (exact-match against default entries).
+///   2. `cfg.extra_excludes` — additional patterns from global +
+///      project config.
+///   3. Interactive/state-saved excludes the user confirmed during
+///      a previous first-run prompt (`ProjectState.excludes`).
+///
+/// Last segment wins on duplicate patterns (rsync handles repeats
+/// fine; just untidy log output otherwise). Returned in deterministic
+/// order so the size scanner and rsync see the same set.
+///
+/// Side effect: warns once for each `cfg.unexclude` entry that doesn't
+/// match a default — almost always a typo, occasionally a stale entry
+/// from a future where the default list was different. Non-fatal so
+/// we don't block builds on a config typo.
+fn build_merged_excludes(cfg: &Config, user: &[String]) -> Vec<String> {
+    let unexclude: &[String] = &cfg.unexclude;
+    let mut out: Vec<String> = Vec::new();
+    for d in ssh::DEFAULT_EXCLUDES {
+        if !unexclude.iter().any(|u| u == d) {
+            out.push((*d).to_string());
+        }
+    }
+    for u in unexclude {
+        if !ssh::DEFAULT_EXCLUDES.iter().any(|d| d == u) {
+            tracing::warn!(
+                pattern = %u,
+                "`unexclude` entry doesn't match any built-in default; \
+                 nothing to remove (typo? stale entry?)"
+            );
+        }
+    }
+    for pat in &cfg.extra_excludes {
+        out.push(pat.clone());
+    }
+    out.extend(user.iter().cloned());
+    out
 }
 
 fn build_matcher(root: &Path, patterns: &[String]) -> Result<ignore::gitignore::Gitignore> {
@@ -1271,7 +1313,70 @@ mod tests {
             volume_gb: 200,
             ssh_key_path: None,
             forward_env: Vec::new(),
+            extra_excludes: Vec::new(),
+            unexclude: Vec::new(),
         }
+    }
+
+    #[test]
+    fn merged_excludes_default_when_unconfigured() {
+        let cfg = cfg_with("hel1", &[]);
+        let merged = build_merged_excludes(&cfg, &[]);
+        // Every default present, no user extras.
+        for d in ssh::DEFAULT_EXCLUDES {
+            assert!(merged.iter().any(|m| m == d), "missing default {d}");
+        }
+        assert_eq!(merged.len(), ssh::DEFAULT_EXCLUDES.len());
+    }
+
+    #[test]
+    fn merged_excludes_unexclude_removes_the_default() {
+        let mut cfg = cfg_with("hel1", &[]);
+        cfg.unexclude = vec![".git/".into()];
+        let merged = build_merged_excludes(&cfg, &[]);
+        assert!(!merged.iter().any(|m| m == ".git/"));
+        // Other defaults still there.
+        assert!(merged.iter().any(|m| m == "target/"));
+    }
+
+    #[test]
+    fn merged_excludes_extra_excludes_appended() {
+        let mut cfg = cfg_with("hel1", &[]);
+        cfg.extra_excludes = vec!["fixtures/large/".into(), "*.bak".into()];
+        let merged = build_merged_excludes(&cfg, &[]);
+        // Defaults still present, extras appended afterward.
+        assert!(merged.iter().any(|m| m == "target/"));
+        assert!(merged.iter().any(|m| m == "fixtures/large/"));
+        assert!(merged.iter().any(|m| m == "*.bak"));
+    }
+
+    #[test]
+    fn merged_excludes_state_user_excludes_appended_last() {
+        let cfg = cfg_with("hel1", &[]);
+        let user = vec!["dist/".to_string()];
+        let merged = build_merged_excludes(&cfg, &user);
+        assert_eq!(merged.last(), Some(&"dist/".to_string()));
+    }
+
+    #[test]
+    fn merged_excludes_combines_unexclude_extra_and_user() {
+        let mut cfg = cfg_with("hel1", &[]);
+        cfg.unexclude = vec![".git/".into()];
+        cfg.extra_excludes = vec!["fixtures/".into()];
+        let merged = build_merged_excludes(&cfg, &["dist/".to_string()]);
+        assert!(!merged.iter().any(|m| m == ".git/"));
+        assert!(merged.iter().any(|m| m == "fixtures/"));
+        assert!(merged.iter().any(|m| m == "dist/"));
+    }
+
+    #[test]
+    fn merged_excludes_unknown_unexclude_is_warned_not_fatal() {
+        let mut cfg = cfg_with("hel1", &[]);
+        cfg.unexclude = vec!["definitely_not_a_default/".into()];
+        // Doesn't panic; just emits a warn (which we don't capture in
+        // this test). The default list still comes through unchanged.
+        let merged = build_merged_excludes(&cfg, &[]);
+        assert_eq!(merged.len(), ssh::DEFAULT_EXCLUDES.len());
     }
 
     #[test]

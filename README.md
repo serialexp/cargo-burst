@@ -147,6 +147,29 @@ rather than `<workspace>/.cargo-burst.toml` — same convention
 multiple Rust tools can share one `.config/` dir instead of each
 spawning a top-level dotfile.
 
+## Customising what gets sync'd
+
+cargo-burst rsyncs your workspace to the remote with a built-in
+exclude list — by default `target/`, `.git/`, `node_modules/`,
+`.direnv/`, `.vscode/`, `.idea/`, `*.swp`, `.DS_Store`. Two config
+fields let you bend that per-project (set in
+`<workspace>/.config/cargo-burst.toml`) or globally:
+
+```toml
+# Drop a specific built-in default for this project. Common case:
+# binaries that need a real git checkout (build stamping, scripts
+# that shell out to `git`).
+unexclude = [".git/"]
+
+# Add patterns on top of the (filtered) default list.
+extra_excludes = ["fixtures/large/", "*.bak"]
+```
+
+Both are **additive** across global → project: setting `unexclude`
+in the project file doesn't undo a global one. An `unexclude` entry
+that doesn't match any built-in default emits a warning at sync
+time but isn't fatal — typos shouldn't block builds.
+
 ## Database services for integration tests
 
 The base image ships with `postgres`, `mysql`, and `redis` installed,

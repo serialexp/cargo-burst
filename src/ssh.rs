@@ -288,7 +288,7 @@ pub async fn rsync_to(
     key_path: &Path,
     src: &Path,
     dest: &str,
-    extra_excludes: &[&str],
+    excludes: &[&str],
     remote_mkdir: Option<&str>,
 ) -> Result<()> {
     let mut cmd = Command::new("rsync");
@@ -323,12 +323,10 @@ pub async fn rsync_to(
         s
     };
     cmd.arg(ssh_inner);
-    // Default excludes — keep the server-side copy from inheriting the
-    // user's local target/, .git/, IDE droppings, etc.
-    for e in DEFAULT_EXCLUDES {
-        cmd.arg("--exclude").arg(e);
-    }
-    for e in extra_excludes {
+    // Caller composes the full exclude list — defaults, project's
+    // `unexclude`, project's `extra_excludes`, and the historical
+    // interactive `state.excludes`. We just feed it to rsync.
+    for e in excludes {
         cmd.arg("--exclude").arg(e);
     }
     // Trailing slash on the source so rsync copies *contents*, matching the
