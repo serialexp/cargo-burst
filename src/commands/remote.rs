@@ -1006,13 +1006,51 @@ pub async fn run_cargo_passthrough(
     with_remote(opts, label, move |ctx: RemoteCtx| async move {
         let escaped: Vec<String> = cargo_args.iter().map(|a| shell_escape(a)).collect();
         let cmd = build_remote_cmd(&ctx, &format!("cargo {}", escaped.join(" ")));
-        let status = ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
+        let status = run_cargo_with_hints(&ctx, default_verb, &cmd).await?;
         if !status.success() {
             return Err(anyhow!("cargo exited with status {status}"));
         }
         Ok(())
     })
     .await
+}
+
+/// Run a cargo invocation on the prepared remote, streaming output
+/// to the caller's terminal AND scanning the captured stream for
+/// hint-eligible failure patterns. On a non-zero exit, prints any
+/// detected hint to stderr before returning the status to the
+/// caller.
+///
+/// All cargo-verb call sites should use this rather than calling
+/// `ssh::run_remote` directly — the per-verb `verb_for_hint`
+/// (`"build"`, `"test"`, …) is the string we'll splice into the
+/// suggested `cargo burst <verb> --env …` command line.
+///
+/// Returns the raw exit status; the caller still decides whether to
+/// fail, retry, or chain to a follow-up phase (e.g. test's nextest
+/// → doctest sequence).
+pub async fn run_cargo_with_hints(
+    ctx: &RemoteCtx,
+    verb_for_hint: &str,
+    cmd: &str,
+) -> Result<std::process::ExitStatus> {
+    let (status, captured) = ssh::run_remote_capturing(
+        &ctx.server_ip,
+        "work",
+        &ctx.ssh_key_path,
+        cmd,
+    )
+    .await?;
+    if !status.success() {
+        if let Some(hint) = crate::hints::detect_env_hint(&captured) {
+            // Hint goes to stderr so it doesn't get tangled in stdout
+            // pipelines (e.g. `cargo burst test | tee out.log`). The
+            // formatter starts with a leading newline so the hint
+            // visually separates from cargo's own error trail.
+            eprint!("{}", hint.format(verb_for_hint));
+        }
+    }
+    Ok(status)
 }
 
 /// Shell prefix that blocks until postgres/mysql/redis are reachable

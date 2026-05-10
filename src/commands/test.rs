@@ -29,7 +29,6 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::commands::remote::{self, RemoteCtx, RemoteOptions};
-use crate::ssh;
 
 #[derive(Args, Debug)]
 pub struct TestArgs {
@@ -92,7 +91,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
             // on a freshly-cold-booted server.
             let body = format!("{}cargo test{extra}", remote::DB_WAIT_PREFIX);
             let cmd = remote::build_remote_cmd(&ctx, &body);
-            let status = ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
+            let status = remote::run_cargo_with_hints(&ctx, "test", &cmd).await?;
             if !status.success() {
                 return Err(anyhow!("cargo test exited with status {status}"));
             }
@@ -102,8 +101,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
         // Default path: nextest first.
         let body = format!("{}cargo nextest run{extra}", remote::DB_WAIT_PREFIX);
         let cmd = remote::build_remote_cmd(&ctx, &body);
-        let nextest_status =
-            ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
+        let nextest_status = remote::run_cargo_with_hints(&ctx, "test", &cmd).await?;
 
         if !nextest_status.success() {
             // Bail before doctests — no point exercising them on a
@@ -167,8 +165,7 @@ pub async fn run(args: TestArgs) -> Result<()> {
         // last-flag-wins convention.
         let body = format!("cargo test --doc --quiet{extra}");
         let cmd = remote::build_remote_cmd(&ctx, &body);
-        let doc_status =
-            ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
+        let doc_status = remote::run_cargo_with_hints(&ctx, "test", &cmd).await?;
         if !doc_status.success() {
             return Err(anyhow!("cargo test --doc exited with status {doc_status}"));
         }

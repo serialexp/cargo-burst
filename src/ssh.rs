@@ -186,6 +186,70 @@ pub async fn run_remote(
     Ok(status)
 }
 
+/// Like `run_remote`, but additionally captures combined stdout +
+/// stderr into a returned `String` while still streaming both to the
+/// caller's terminal in real time. Used by the cargo-verb call sites
+/// so we can post-mortem the output for actionable hints
+/// (`hints::detect_env_hint` etc.) on failure.
+///
+/// Memory cost is bounded by however much cargo prints during the
+/// run — for a green test suite that's a few KB, for a failed
+/// compilation it might be a few hundred KB. Either way well under
+/// any threshold worth streaming-with-cap-and-truncate logic for.
+pub async fn run_remote_capturing(
+    host: &str,
+    user: &str,
+    key_path: &Path,
+    remote_cmd: &str,
+) -> Result<(std::process::ExitStatus, String)> {
+    use std::sync::{Arc, Mutex};
+    let mut cmd = Command::new("ssh");
+    cmd.args(base_ssh_opts(key_path, host));
+    cmd.arg(format!("{user}@{host}"));
+    cmd.arg(remote_cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    let mut child = cmd.spawn().context("spawning ssh")?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    // Single mutex around the combined buffer — interleaving stdout
+    // and stderr in the order lines actually appear on the wire is
+    // what we want for hint detection (panic backtraces span both).
+    let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let cap_out = captured.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            println!("{line}");
+            if let Ok(mut g) = cap_out.lock() {
+                g.push_str(&line);
+                g.push('\n');
+            }
+        }
+    });
+    let cap_err = captured.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("{line}");
+            if let Ok(mut g) = cap_err.lock() {
+                g.push_str(&line);
+                g.push('\n');
+            }
+        }
+    });
+    let status = child.wait().await.context("waiting on ssh")?;
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    // By the time both tasks have joined, the only remaining Arc
+    // owner is the local binding — `try_unwrap` succeeds and we can
+    // move out the String without an extra clone.
+    let combined = match Arc::try_unwrap(captured) {
+        Ok(m) => m.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    };
+    Ok((status, combined))
+}
+
 /// Run a remote command and capture its stdout (no streaming). Useful for
 /// queries like `df -h` whose output is small and we want to parse.
 pub async fn capture_remote(

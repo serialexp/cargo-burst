@@ -63,7 +63,7 @@ pub async fn run(args: BuildArgs) -> Result<()> {
     remote::with_remote(opts, "Build", move |ctx: RemoteCtx| async move {
         let escaped: Vec<String> = cargo_args.iter().map(|a| remote::shell_escape(a)).collect();
         let cmd = remote::build_remote_cmd(&ctx, &format!("cargo {}", escaped.join(" ")));
-        let status = ssh::run_remote(&ctx.server_ip, "work", &ctx.ssh_key_path, &cmd).await?;
+        let status = remote::run_cargo_with_hints(&ctx, "build", &cmd).await?;
         if !status.success() {
             return Err(anyhow!("cargo exited with status {status}"));
         }

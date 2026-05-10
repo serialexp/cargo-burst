@@ -12,6 +12,7 @@ mod audit;
 mod commands;
 mod config;
 mod hcloud;
+mod hints;
 mod project;
 mod ssh;
 
