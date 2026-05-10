@@ -134,9 +134,37 @@ struct SessionStats {
     by_reason: BTreeMap<TerminationReason, u32>,
 }
 
+/// Accounting for "we killed a server only to bring it back up shortly
+/// after" cycles. Each entry pairs a `ServerTerminated` event with the
+/// next `ServerProvisioned` event in time order; the gap between the
+/// two is the churn interval. Useful for spotting cases where the
+/// keep-alive window is set too aggressively (lots of `reap` →
+/// reprovision pairs at small gaps), or where the user is `down`-ing
+/// then immediately needing the server back.
+///
+/// Buckets are inclusive (≤). A 0-second gap counts in all three.
+#[derive(Default, Debug)]
+struct ChurnStats {
+    /// Total `ServerTerminated → next ServerProvisioned` pairs we saw.
+    /// Excludes terminations with no following provision (i.e. the
+    /// final termination in the log).
+    total_pairs: u32,
+    within_10m: u32,
+    within_30m: u32,
+    within_60m: u32,
+    /// Per-bucket breakdown by the termination reason, so the user can
+    /// tell whether short-gap reprovisions were the reaper firing too
+    /// soon vs explicit `down` regrets.
+    within_60m_by_reason: BTreeMap<TerminationReason, u32>,
+    /// Sum of gaps for the bucketed (≤ 60 min) pairs, used to compute
+    /// the mean gap of the close-churn population.
+    sum_gap_secs_within_60m: f64,
+}
+
 #[derive(Default, Debug)]
 struct Stats {
     sessions: SessionStats,
+    churn: ChurnStats,
     cold: PhaseStats,
     warm: PhaseStats,
     by_verb: BTreeMap<String, PhaseStats>,
@@ -146,12 +174,34 @@ struct Stats {
 /// Easy to unit-test by hand-constructing event vectors.
 fn compute(events: &[Event]) -> Stats {
     let mut s = Stats::default();
+    // Pending = the most-recent ServerTerminated that hasn't yet been
+    // paired with a ServerProvisioned. We pair on the very next
+    // provision regardless of how distant — the buckets (≤10/30/60m)
+    // bin the gap, and pairs whose gap exceeds 60m simply contribute
+    // to total_pairs without landing in any bucket.
+    let mut pending_term: Option<(String, TerminationReason)> = None;
     for ev in events {
         match ev {
-            Event::ServerProvisioned { .. } => {
+            Event::ServerProvisioned { ts, .. } => {
                 s.sessions.provisioned = s.sessions.provisioned.saturating_add(1);
+                if let Some((ended_at, reason)) = pending_term.take() {
+                    let gap = audit::elapsed_secs(&ended_at, ts);
+                    s.churn.total_pairs = s.churn.total_pairs.saturating_add(1);
+                    if gap <= 60.0 * 60.0 {
+                        s.churn.within_60m = s.churn.within_60m.saturating_add(1);
+                        s.churn.sum_gap_secs_within_60m += gap;
+                        *s.churn.within_60m_by_reason.entry(reason).or_default() += 1;
+                        if gap <= 30.0 * 60.0 {
+                            s.churn.within_30m = s.churn.within_30m.saturating_add(1);
+                        }
+                        if gap <= 10.0 * 60.0 {
+                            s.churn.within_10m = s.churn.within_10m.saturating_add(1);
+                        }
+                    }
+                }
             }
             Event::ServerTerminated {
+                ended_at,
                 lifetime_secs,
                 command_count,
                 reason,
@@ -162,6 +212,14 @@ fn compute(events: &[Event]) -> Stats {
                 s.sessions.total_commands_in_terminated =
                     s.sessions.total_commands_in_terminated.saturating_add(*command_count);
                 *s.sessions.by_reason.entry(*reason).or_default() += 1;
+                // Record this termination as the candidate for the
+                // next provision pairing. If a previous termination
+                // was still pending (i.e. two terminations in a row
+                // with no provision between — shouldn't happen on a
+                // healthy log but can on a corrupted one), we drop
+                // it: the closer-in-time termination is the more
+                // honest pairing.
+                pending_term = Some((ended_at.clone(), *reason));
             }
             Event::Command {
                 verb,
@@ -216,6 +274,12 @@ fn fmt_pct(num: f64, denom: f64) -> String {
     if denom <= 0.0 { "—".to_string() } else { format!("{:.0}%", 100.0 * num / denom) }
 }
 
+/// "  (40%)" or empty when num is zero. Lets the churn report stay
+/// quiet for buckets that didn't fire instead of cluttering with "0%".
+fn churn_pct_suffix(num: u32, denom: u32) -> String {
+    if num == 0 || denom == 0 { String::new() } else { format!("  ({:.0}%)", 100.0 * num as f64 / denom as f64) }
+}
+
 /// Compute total server cost given a per-hour rate. Pure function so
 /// it's easy to unit-test independently of the report formatter.
 fn cost_eur(total_lifetime_secs: f64, rate_per_hour: f64) -> f64 {
@@ -257,6 +321,46 @@ fn print_report(s: &Stats, path: &Path, raw_events: usize, skipped: usize, rate:
         }
     }
     println!();
+
+    // ── Server churn ───────────────────────────────────────────────
+    // "How often did we kill a server only to bring it back up shortly
+    // after?" — short-gap reprovisions (especially after `reap`) are a
+    // signal the keep-alive window is set too aggressively. Skipped
+    // when the log has fewer than two server lifetimes' worth of data
+    // — there's nothing meaningful to say yet.
+    if s.churn.total_pairs > 0 {
+        println!("Server churn (terminate → next provision)");
+        println!("  reprovisioned after a kill: {} times", s.churn.total_pairs);
+        println!(
+            "    within 10 min:  {}{}",
+            s.churn.within_10m,
+            churn_pct_suffix(s.churn.within_10m, s.churn.total_pairs),
+        );
+        println!(
+            "    within 30 min:  {}{}",
+            s.churn.within_30m,
+            churn_pct_suffix(s.churn.within_30m, s.churn.total_pairs),
+        );
+        println!(
+            "    within 60 min:  {}{}",
+            s.churn.within_60m,
+            churn_pct_suffix(s.churn.within_60m, s.churn.total_pairs),
+        );
+        if s.churn.within_60m > 0 {
+            let mean_gap = s.churn.sum_gap_secs_within_60m / s.churn.within_60m as f64;
+            println!("  mean gap (≤60m pairs): {}", fmt_secs(mean_gap));
+            if !s.churn.within_60m_by_reason.is_empty() {
+                let parts: Vec<String> = s
+                    .churn
+                    .within_60m_by_reason
+                    .iter()
+                    .map(|(r, n)| format!("{r:?}={n}"))
+                    .collect();
+                println!("  ≤60m by termination reason: {}", parts.join("  "));
+            }
+        }
+        println!();
+    }
 
     // ── Cost ──────────────────────────────────────────────────────
     // Only printed when the user passes `--rate`. Hetzner bills per
@@ -379,6 +483,28 @@ mod tests {
         }
     }
 
+    fn term_at(ended_at: &str, r: TerminationReason) -> Event {
+        Event::ServerTerminated {
+            ts: ended_at.into(),
+            server_id: 1,
+            started_at: "2026-05-06T00:00:00Z".into(),
+            ended_at: ended_at.into(),
+            lifetime_secs: 0.0,
+            command_count: 0,
+            reason: r,
+        }
+    }
+
+    fn prov_at(ts: &str) -> Event {
+        Event::ServerProvisioned {
+            ts: ts.into(),
+            server_id: 1,
+            server_type: "ccx63".into(),
+            image_id: 100,
+            region: "hel1".into(),
+        }
+    }
+
     #[test]
     fn cold_warm_split() {
         let evs = vec![
@@ -440,6 +566,67 @@ mod tests {
     fn fmt_pct_handles_zero_denom() {
         assert_eq!(fmt_pct(0.0, 0.0), "—");
         assert_eq!(fmt_pct(50.0, 100.0), "50%");
+    }
+
+    #[test]
+    fn churn_buckets_are_inclusive_and_nested() {
+        // Three terminate→reprovision pairs:
+        //   1. 5min gap   → counts in 10/30/60
+        //   2. 20min gap  → counts in 30/60
+        //   3. 45min gap  → counts in 60 only
+        let evs = vec![
+            prov_at("2026-05-06T00:00:00Z"),
+            term_at("2026-05-06T00:10:00Z", TerminationReason::Reap),
+            prov_at("2026-05-06T00:15:00Z"),                    // 5m
+            term_at("2026-05-06T00:20:00Z", TerminationReason::Reap),
+            prov_at("2026-05-06T00:40:00Z"),                    // 20m
+            term_at("2026-05-06T00:50:00Z", TerminationReason::Down),
+            prov_at("2026-05-06T01:35:00Z"),                    // 45m
+        ];
+        let s = compute(&evs);
+        assert_eq!(s.churn.total_pairs, 3);
+        assert_eq!(s.churn.within_10m, 1);
+        assert_eq!(s.churn.within_30m, 2);
+        assert_eq!(s.churn.within_60m, 3);
+        // Mean gap of the ≤60m population = (5+20+45)/3 = 23.333 min
+        let mean_min = s.churn.sum_gap_secs_within_60m / s.churn.within_60m as f64 / 60.0;
+        assert!((mean_min - (5.0 + 20.0 + 45.0) / 3.0).abs() < 1e-6);
+        // Reasons: two reap, one down within the ≤60m bucket.
+        assert_eq!(s.churn.within_60m_by_reason.get(&TerminationReason::Reap), Some(&2));
+        assert_eq!(s.churn.within_60m_by_reason.get(&TerminationReason::Down), Some(&1));
+    }
+
+    #[test]
+    fn churn_above_60m_counts_pair_but_no_bucket() {
+        let evs = vec![
+            prov_at("2026-05-06T00:00:00Z"),
+            term_at("2026-05-06T00:10:00Z", TerminationReason::Reap),
+            prov_at("2026-05-06T03:00:00Z"),                    // ~170m later
+        ];
+        let s = compute(&evs);
+        assert_eq!(s.churn.total_pairs, 1);
+        assert_eq!(s.churn.within_10m, 0);
+        assert_eq!(s.churn.within_30m, 0);
+        assert_eq!(s.churn.within_60m, 0);
+        assert_eq!(s.churn.sum_gap_secs_within_60m, 0.0);
+    }
+
+    #[test]
+    fn churn_no_pairs_when_log_ends_on_termination() {
+        let evs = vec![
+            prov_at("2026-05-06T00:00:00Z"),
+            term_at("2026-05-06T00:10:00Z", TerminationReason::Reap),
+        ];
+        let s = compute(&evs);
+        assert_eq!(s.churn.total_pairs, 0);
+    }
+
+    #[test]
+    fn churn_first_provision_isnt_paired() {
+        // Provision-only log (no preceding terminate) doesn't manufacture a pair.
+        let evs = vec![prov_at("2026-05-06T00:00:00Z")];
+        let s = compute(&evs);
+        assert_eq!(s.churn.total_pairs, 0);
     }
 
     #[test]
