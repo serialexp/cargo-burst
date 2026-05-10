@@ -71,6 +71,7 @@ cargo burst bench                  # criterion HTML reports rsynced back
 | `cargo burst check [args]`   | `cargo check [args]`                     | nothing                                       |
 | `cargo burst clippy [args]`  | `cargo clippy [args]`                    | nothing                                       |
 | `cargo burst bench [args]`   | `cargo bench [args]`                     | `target/criterion/` (recursive, if present)   |
+| `cargo burst run [args]`     | `cargo run [args]` (build + execute on remote; stdout/stderr stream back, stdin closed) | nothing (file outputs stay on remote) |
 | `cargo burst status`         | —                                        | shows what's provisioned + last-used per project |
 | `cargo burst audit`          | —                                        | summarises the lifecycle log (sessions, cold-vs-warm timings, wall-time split, per-verb means; pass `--rate EUR_PER_HOUR` for cost) |
 | `cargo burst down`           | deletes the running server (volumes kept) | (use `--with-volumes` to delete all volumes too) |

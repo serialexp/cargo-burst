@@ -12,5 +12,6 @@ pub mod image;
 pub mod install;
 pub mod reap;
 pub mod remote;
+pub mod run;
 pub mod status;
 pub mod test;

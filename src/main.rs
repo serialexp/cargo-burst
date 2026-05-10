@@ -64,6 +64,18 @@ enum Command {
     /// Run `cargo clippy` on the remote server. Pure passthrough — no
     /// artifact fetch, output streams back over SSH.
     Clippy(commands::clippy::ClippyArgs),
+    /// Run `cargo run` on the remote server. Builds and executes the
+    /// binary on the CCX63 (48 cores / 192 GB RAM); stdout/stderr
+    /// stream back over SSH. Useful for embarrassingly-parallel
+    /// CPU-bound binaries (perf debugging, parameter sweeps, large
+    /// one-offs). Stdin is closed; no TTY allocation.
+    ///
+    /// Args after `--` go verbatim to cargo, including the second
+    /// `--` separating cargo's flags from the binary's arguments:
+    ///
+    ///   cargo burst run -- --release --bin foo -- arg1 arg2
+    #[command(verbatim_doc_comment)]
+    Run(commands::run::RunArgs),
     /// Run `cargo bench` on the remote server. Consistent hardware
     /// makes bench numbers comparable across runs. By default the
     /// criterion HTML report dir (if present) is rsynced back into
@@ -140,6 +152,7 @@ async fn main() -> Result<()> {
         Command::Check(args) => commands::check::run(args).await,
         Command::Clippy(args) => commands::clippy::run(args).await,
         Command::Bench(args) => commands::bench::run(args).await,
+        Command::Run(args) => commands::run::run(args).await,
         Command::Status => commands::status::run().await,
         Command::Audit(args) => commands::audit::run(args).await,
         Command::Down(args) => commands::down::run(args).await,
