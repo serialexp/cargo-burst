@@ -1192,6 +1192,28 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
         //
         // Both can be overridden by user `--env CARGO_TERM_COLOR=…`
         // / `--env CI=…` (exported after this).
+        // Pre-start the sccache server with stdin/stdout/stderr all
+        // redirected to /dev/null *before* cargo runs. The baked image
+        // sets `rustc-wrapper = /usr/local/bin/sccache` globally, so
+        // every cargo invocation pipes rustc through sccache. If the
+        // sccache server isn't already running, the client lazy-forks
+        // it from the cargo process tree — and that daemon inherits
+        // cargo's stdin/stdout/stderr, which under `-tt` are the
+        // remote PTY's slave fds. After cargo exits, the sccache
+        // server keeps the PTY open, sshd refuses to close the channel
+        // until every PTY-slave fd is released, and our local
+        // `child.wait()` hangs indefinitely. (Symptom: `cargo burst
+        // test` "sometimes hangs" — specifically when the sccache
+        // server has timed out since the previous run and needs a
+        // fresh start.)
+        //
+        // Forcing the start here, with all three std fds bound to
+        // /dev/null inside a backgrounded subshell, daemonizes the
+        // server with no references to the PTY. Cargo's later
+        // sccache-client calls find the server already running and
+        // never fork. `|| true` because old baked images may not have
+        // sccache at all — graceful degradation rather than a hard
+        // fail under `set -e`.
         "set -euo pipefail; \
          export CARGO_TARGET_DIR={target}; \
          export SCCACHE_DIR={sccache}; \
@@ -1200,6 +1222,7 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
          export CI=true; \
          {user_exports}\
          mkdir -p {target} {sccache}; \
+         (sccache --start-server </dev/null >/dev/null 2>&1 || true); \
          cd {src}; \
          {body}",
         target = ctx.target_dir,

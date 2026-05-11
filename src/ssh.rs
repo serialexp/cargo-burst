@@ -350,9 +350,37 @@ pub async fn run_remote_capturing(
             }
         }
     });
+    // Grab abort handles before consuming the JoinHandles in the
+    // timeout below — once `await`ed (even inside a timeout), the
+    // JoinHandle is moved and we can't reach back to abort the task.
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
     let status = child.wait().await.context("waiting on ssh")?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    // Defense in depth: ssh has exited, so its stdout/stderr pipes
+    // should EOF and our reader tasks should drain in milliseconds.
+    // If they're still pending after a short grace period something
+    // pathological is keeping the pipes open (most likely a remote
+    // grandchild that inherited the PTY's slave fd — pre-starting
+    // sccache in `build_remote_cmd` should prevent the known case,
+    // but other build-script daemons could theoretically do the
+    // same). Abort and move on rather than letting the function
+    // hang forever; the captured buffer is only used for post-hoc
+    // hint detection, so missing a few trailing bytes is fine.
+    let drain_deadline = std::time::Duration::from_secs(2);
+    let drained = tokio::time::timeout(drain_deadline, async {
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            "ssh exited but stdout/stderr drain stalled past 2s; aborting readers \
+             (this usually means a remote grandchild — build-script daemon or \
+             similar — is holding a PTY slave fd open after the main process exited)"
+        );
+        stdout_abort.abort();
+        stderr_abort.abort();
+    }
     // By the time both tasks have joined, the only remaining Arc
     // owner is the local binding — `try_unwrap` succeeds and we can
     // move out the String without an extra clone.
