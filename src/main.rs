@@ -129,9 +129,47 @@ fn install_tracing() {
         .init();
 }
 
+/// Install a SIGINT / SIGTERM handler that SIGTERMs every tracked ssh
+/// child before exiting. This is the "parent got Ctrl-C / killed"
+/// branch of the kill-propagation story; `kill_on_drop` on each
+/// `Command` handles the panic / `?`-early-return branch, and `-tt`
+/// on the ssh invocation lets sshd propagate the resulting connection
+/// drop to the remote process as SIGHUP. The combination ensures
+/// killing the local `cargo-burst` actually stops the cargo run on the
+/// remote, instead of orphaning a build on a server we're paying for.
+fn install_signal_handlers() {
+    use tokio::signal::unix::{SignalKind, signal};
+    tokio::spawn(async move {
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Exit codes follow the conventional "128 + signo": 130 for
+        // SIGINT, 143 for SIGTERM. Matches what a shell would report.
+        let code = tokio::select! {
+            _ = sigint.recv() => 130,
+            _ = sigterm.recv() => 143,
+        };
+        eprintln!("\ncargo-burst: signal received, terminating remote ssh sessions…");
+        ssh::kill_all_tracked_ssh();
+        // Give the local ssh clients a brief moment to flush the
+        // channel-close to sshd so the SIGHUP→remote-process chain
+        // actually fires. 500ms is more than enough for a TCP FIN
+        // round-trip on any sane link; we'd rather wait half a second
+        // than orphan a multi-hour build.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::process::exit(code);
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     install_tracing();
+    install_signal_handlers();
 
     // Strip the leading `burst` arg if invoked as `cargo burst …`. Cargo
     // passes the subcommand name through as argv[1], which would otherwise

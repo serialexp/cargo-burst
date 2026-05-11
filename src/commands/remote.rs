@@ -1102,11 +1102,17 @@ pub async fn run_cargo_with_hints(
     verb_for_hint: &str,
     cmd: &str,
 ) -> Result<std::process::ExitStatus> {
+    // force_tty=true: allocates a remote PTY so that when the local
+    // ssh client is killed (Ctrl-C, SIGTERM via signal handler) sshd
+    // forwards SIGHUP to the cargo process on the remote. Without
+    // this, the cargo run would keep going for minutes after we
+    // abandoned it, on a server we're paying for.
     let (status, captured) = ssh::run_remote_capturing(
         &ctx.server_ip,
         "work",
         &ctx.ssh_key_path,
         cmd,
+        true,
     )
     .await?;
     if !status.success() {
@@ -1164,10 +1170,18 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
         format!("{user_exports} ")
     };
     format!(
+        // CARGO_TERM_COLOR=never: we pass `-tt` to ssh for the cargo
+        // verbs (so signals propagate on connection drop), which makes
+        // cargo see a TTY and emit ANSI colors. Captured output would
+        // then have escape sequences embedded mid-message, breaking
+        // `hints::detect_env_hint`'s substring match. Force colors
+        // off here as an internal pin; user `--env CARGO_TERM_COLOR=…`
+        // would still win (exported after this).
         "set -euo pipefail; \
          export CARGO_TARGET_DIR={target}; \
          export SCCACHE_DIR={sccache}; \
          export PATH=$HOME/.cargo/bin:$PATH; \
+         export CARGO_TERM_COLOR=never; \
          {user_exports}\
          mkdir -p {target} {sccache}; \
          cd {src}; \

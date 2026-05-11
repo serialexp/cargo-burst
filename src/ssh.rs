@@ -7,10 +7,94 @@
 
 use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+
+// ── ssh kill-propagation infrastructure ───────────────────────────────
+//
+// We track the PIDs of every ssh child we spawn so the signal handler
+// installed in `main.rs` can SIGTERM them on Ctrl-C / `kill <pid>`.
+// Killing the local ssh cleanly closes its TCP connection, and when
+// the spawn site requested a PTY (via `force_tty`), sshd then sends
+// SIGHUP to the remote process, so a kill on the laptop actually
+// stops the cargo run on the CCX63 — instead of leaving an orphaned
+// build chugging through to completion on a server we're paying for.
+//
+// Why a global registry and not a single passed-around handle?
+//   - Multiple ssh children can be in flight concurrently (mount +
+//     rsync run in parallel inside `with_remote`).
+//   - The signal handler lives in a tokio::spawn at top level and
+//     doesn't have a path to whatever subcommand is running.
+//   - We don't track Child handles directly because we still want
+//     the original tokio task to own and `wait()` on its child; the
+//     handler just needs to fire a SIGTERM.
+
+/// Returns the singleton registry of currently-running ssh child PIDs.
+fn ssh_pid_registry() -> &'static Mutex<HashSet<u32>> {
+    static R: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII guard returned from each ssh spawn site. Adds the child's
+/// PID to the registry on construction and removes it on drop —
+/// works for normal-completion paths, `?` early returns, and
+/// panics. Doesn't fire on signal-killed parent processes (Drop
+/// doesn't run then), but the signal handler doesn't care: a stale
+/// entry in the registry is harmless because we exit immediately
+/// after kill_all_tracked_ssh anyway.
+struct TrackedSshGuard {
+    pid: u32,
+}
+
+impl TrackedSshGuard {
+    fn new(pid: u32) -> Self {
+        if pid != 0 {
+            if let Ok(mut g) = ssh_pid_registry().lock() {
+                g.insert(pid);
+            }
+        }
+        Self { pid }
+    }
+}
+
+impl Drop for TrackedSshGuard {
+    fn drop(&mut self) {
+        if self.pid != 0 {
+            if let Ok(mut g) = ssh_pid_registry().lock() {
+                g.remove(&self.pid);
+            }
+        }
+    }
+}
+
+/// SIGTERM every currently-tracked ssh child. Called from the global
+/// signal handler. Doesn't wait for the children to exit — the caller
+/// is expected to give them a short grace period and then `exit()`.
+pub fn kill_all_tracked_ssh() {
+    let pids: Vec<u32> = ssh_pid_registry()
+        .lock()
+        .map(|g| g.iter().copied().collect())
+        .unwrap_or_default();
+    for pid in pids {
+        // SIGTERM (not SIGKILL): gives the local ssh client a chance
+        // to send the channel-close to sshd cleanly, which is what
+        // triggers the SIGHUP→remote-process chain when we requested
+        // `-tt`. SIGKILL would yank the ssh client without the close
+        // round-trip, and the remote could stay alive longer.
+        //
+        // Safety: `kill(pid, SIGTERM)` with a valid pid is a no-op
+        // if the target has already exited (returns ESRCH). Unsafe
+        // because libc::kill is FFI; semantically safe to call from
+        // any thread.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+}
 
 /// Common ssh options for talking to a freshly-provisioned cloud VM whose
 /// host key we haven't seen before. We deliberately disable host-key
@@ -126,6 +210,7 @@ pub async fn wait_for_ssh(
                 cmd.stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .stdin(Stdio::null());
+                cmd.kill_on_drop(true);
                 let status = cmd.status().await.context("spawning ssh")?;
                 if status.success() {
                     tracing::info!(host, elapsed = ?start.elapsed(), "ssh is up");
@@ -152,6 +237,11 @@ pub async fn wait_for_ssh(
 
 /// Run a command on the remote host, streaming stdout/stderr back to the
 /// caller's terminal as it arrives. Returns the exit status.
+///
+/// `kill_on_drop(true)` ensures that if this function's future is
+/// dropped (panic, `?`-error elsewhere in the join, abort) the local
+/// ssh process is killed too, so we don't leak a connection. The
+/// global PID registry covers the signal-killed-parent case.
 pub async fn run_remote(
     host: &str,
     user: &str,
@@ -163,7 +253,9 @@ pub async fn run_remote(
     cmd.arg(format!("{user}@{host}"));
     cmd.arg(remote_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning ssh")?;
+    let _guard = TrackedSshGuard::new(child.id().unwrap_or(0));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout_task = tokio::spawn(async move {
@@ -192,6 +284,17 @@ pub async fn run_remote(
 /// so we can post-mortem the output for actionable hints
 /// (`hints::detect_env_hint` etc.) on failure.
 ///
+/// `force_tty=true` passes `-tt` to ssh, which allocates a remote
+/// PTY for the command. With a PTY, dropping the ssh connection
+/// (which is what happens when the local process gets SIGTERM /
+/// SIGINT) causes sshd to SIGHUP the remote command — so a Ctrl-C
+/// on the laptop actually stops the cargo run on the remote, instead
+/// of orphaning a multi-minute build on a server we're paying for.
+/// Without `-tt`, sshd doesn't propagate signals on connection drop
+/// and the remote command runs to completion. We only opt in here
+/// (and from the cargo-verb call sites), not on short-lived helpers
+/// like `run_remote` (mount script) or `capture_remote`.
+///
 /// Memory cost is bounded by however much cargo prints during the
 /// run — for a green test suite that's a few KB, for a failed
 /// compilation it might be a few hundred KB. Either way well under
@@ -201,14 +304,24 @@ pub async fn run_remote_capturing(
     user: &str,
     key_path: &Path,
     remote_cmd: &str,
+    force_tty: bool,
 ) -> Result<(std::process::ExitStatus, String)> {
     use std::sync::{Arc, Mutex};
     let mut cmd = Command::new("ssh");
     cmd.args(base_ssh_opts(key_path, host));
+    if force_tty {
+        // `-tt` (vs single `-t`) forces TTY even when ssh's local
+        // stdin is not a TTY. We give ssh a null stdin (below) so
+        // without the double-t it would silently fall back to no-PTY
+        // mode and we'd lose signal propagation.
+        cmd.arg("-tt");
+    }
     cmd.arg(format!("{user}@{host}"));
     cmd.arg(remote_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("spawning ssh")?;
+    let _guard = TrackedSshGuard::new(child.id().unwrap_or(0));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     // Single mutex around the combined buffer — interleaving stdout
@@ -263,6 +376,7 @@ pub async fn capture_remote(
     cmd.arg(format!("{user}@{host}"));
     cmd.arg(remote_cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    cmd.kill_on_drop(true);
     let out = cmd.output().await.context("spawning ssh")?;
     if !out.status.success() {
         return Err(anyhow!(
@@ -334,7 +448,10 @@ pub async fn rsync_to(
     let src_arg = format!("{}/", src.display());
     cmd.arg(src_arg);
     cmd.arg(format!("{user}@{host}:{dest}"));
-    let status = cmd.status().await.context("spawning rsync")?;
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().context("spawning rsync")?;
+    let _guard = TrackedSshGuard::new(child.id().unwrap_or(0));
+    let status = child.wait().await.context("waiting on rsync")?;
     if !status.success() {
         return Err(anyhow!("rsync failed with status {status}"));
     }
@@ -387,7 +504,10 @@ pub async fn rsync_from(
     cmd.arg(ssh_inner);
     cmd.arg(format!("{user}@{host}:{src}"));
     cmd.arg(dest);
-    let status = cmd.status().await.context("spawning rsync")?;
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().context("spawning rsync")?;
+    let _guard = TrackedSshGuard::new(child.id().unwrap_or(0));
+    let status = child.wait().await.context("waiting on rsync")?;
     if !status.success() {
         return Err(anyhow!("rsync failed with status {status}"));
     }

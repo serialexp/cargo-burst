@@ -1,6 +1,6 @@
 [package]
 name = "cargo-burst"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 authors = ["Bart Riepe <bart@serial-experiments.com>"]
 description = "Spin up a Hetzner Cloud server on demand for cargo builds; persistent per-project volume keeps target/ warm between sessions."
@@ -21,6 +21,7 @@ clap = { version = "4", features = ["derive"] }
 directories = "5"
 fs2 = "0.4"
 ignore = "0.4"
+libc = "0.2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
