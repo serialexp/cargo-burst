@@ -837,7 +837,21 @@ fn scan_and_confirm_excludes(
     println!();
 
     let first_run = saved.is_none();
-    if first_run && !auto_yes {
+    // Non-interactive stdin (CI, piped input, automation harness) is
+    // treated the same as `--yes`: skip the prompt entirely, don't
+    // auto-add suggestions to the exclude list. Blocking on a prompt
+    // that no human can answer is the worst outcome; silently
+    // assuming "yes" on EOF (the previous behavior) is only marginally
+    // better — it could quietly drop directories the script-author
+    // didn't expect to be dropped. Sync-as-is is the safe default.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if first_run && !auto_yes && !interactive {
+        tracing::info!(
+            "stdin is not a TTY; skipping first-run exclude prompt and syncing as-is. \
+             Pass `--yes` to silence this, or set `extra_excludes` in config to opt in."
+        );
+    }
+    if should_prompt_excludes(first_run, auto_yes, interactive) {
         let suggestions: Vec<&String> = entries
             .iter()
             .filter(|(name, size)| {
@@ -877,6 +891,18 @@ fn scan_and_confirm_excludes(
     project_state.excludes = Some(user_excludes.clone());
 
     Ok(user_excludes)
+}
+
+/// Should the first-run exclude prompt actually be shown?
+///
+/// Pure function so the policy is unit-testable without owning a
+/// real TTY. The rule is "show only when we've never asked before
+/// (first_run), the caller didn't opt out (auto_yes), and stdin is
+/// a real terminal (interactive)". Any non-interactive caller
+/// (CI, piped stdin, automation harness) is treated the same as
+/// `--yes`: no prompt, no auto-applied suggestions, sync as-is.
+fn should_prompt_excludes(first_run: bool, auto_yes: bool, interactive: bool) -> bool {
+    first_run && !auto_yes && interactive
 }
 
 /// Compose the final rsync exclude list:
@@ -1315,6 +1341,26 @@ mod tests {
             forward_env: Vec::new(),
             extra_excludes: Vec::new(),
             unexclude: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn should_prompt_excludes_truth_table() {
+        // first_run × auto_yes × interactive → expected
+        for (first_run, auto_yes, interactive, expected) in [
+            (false, false, true, false),  // not first run → no prompt
+            (false, true,  true, false),  // not first run → no prompt
+            (false, false, false, false), // not first run → no prompt
+            (true,  true,  true, false),  // --yes wins
+            (true,  true,  false, false), // --yes + non-tty: still skip
+            (true,  false, false, false), // first-run + non-tty: skip
+            (true,  false, true,  true),  // first-run, no --yes, real TTY → prompt
+        ] {
+            assert_eq!(
+                should_prompt_excludes(first_run, auto_yes, interactive),
+                expected,
+                "first_run={first_run} auto_yes={auto_yes} interactive={interactive}",
+            );
         }
     }
 
