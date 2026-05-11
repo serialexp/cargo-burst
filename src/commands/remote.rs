@@ -1170,18 +1170,34 @@ pub fn build_remote_cmd(ctx: &RemoteCtx, body: &str) -> String {
         format!("{user_exports} ")
     };
     format!(
-        // CARGO_TERM_COLOR=never: we pass `-tt` to ssh for the cargo
-        // verbs (so signals propagate on connection drop), which makes
-        // cargo see a TTY and emit ANSI colors. Captured output would
-        // then have escape sequences embedded mid-message, breaking
-        // `hints::detect_env_hint`'s substring match. Force colors
-        // off here as an internal pin; user `--env CARGO_TERM_COLOR=…`
-        // would still win (exported after this).
+        // `-tt` (set on the ssh side, for signal propagation) makes
+        // the remote see a PTY, which makes Rust tooling switch to
+        // interactive output: ANSI colors from cargo, an in-place
+        // progress bar from nextest that uses `\r` instead of `\n`
+        // and never flushes a complete line until the run is over.
+        // Two internal-pin env vars walk that back without losing
+        // signal propagation:
+        //
+        //   CARGO_TERM_COLOR=never — strips color escapes so the
+        //     captured-for-hint-detection output is plain text and
+        //     `hints::detect_env_hint`'s substring match still works.
+        //
+        //   CI=true — the universal "force non-interactive plain
+        //     output" lever Rust tools all respect. Switches nextest
+        //     to its plain reporter (line-per-test, newline-terminated)
+        //     so an agent or piped consumer actually sees the test
+        //     results stream by instead of an opaque ~5s of silence
+        //     followed by "Finished" and nothing else. Cargo treats
+        //     it the same way (suppresses progress spinner).
+        //
+        // Both can be overridden by user `--env CARGO_TERM_COLOR=…`
+        // / `--env CI=…` (exported after this).
         "set -euo pipefail; \
          export CARGO_TARGET_DIR={target}; \
          export SCCACHE_DIR={sccache}; \
          export PATH=$HOME/.cargo/bin:$PATH; \
          export CARGO_TERM_COLOR=never; \
+         export CI=true; \
          {user_exports}\
          mkdir -p {target} {sccache}; \
          cd {src}; \
@@ -1662,6 +1678,43 @@ mod tests {
         // RUST_LOG=debug is alphanumeric only — shell_escape correctly
         // leaves it bare. Just confirm it's there.
         assert!(cmd.contains("export RUST_LOG=debug;"));
+    }
+
+    #[test]
+    fn build_remote_cmd_pins_ci_and_no_color_before_user_exports() {
+        // Regression: without CI=true the remote sees a PTY (via `-tt`
+        // for signal propagation) and nextest switches to its
+        // interactive reporter — carriage-return progress bar, no
+        // newline-flushed line output, agent consumers see nothing.
+        // Both pins must come BEFORE user_exports so a user `--env`
+        // can still override them, but they're set by default.
+        let ctx = RemoteCtx {
+            server_ip: "1.2.3.4".into(),
+            ssh_key_path: PathBuf::from("/dev/null"),
+            workspace_root: PathBuf::from("/tmp"),
+            remote_src: "/home/work/src/abc".into(),
+            target_dir: "/mnt/cache/abc/target".into(),
+            sccache_dir: "/mnt/cache/abc/sccache".into(),
+            env: vec![("CI".into(), "user-override".into())],
+        };
+        let cmd = build_remote_cmd(&ctx, "cargo test");
+        let internal_ci = cmd
+            .find("export CI=true;")
+            .expect("internal CI=true pin must be present");
+        let internal_no_color = cmd
+            .find("export CARGO_TERM_COLOR=never;")
+            .expect("internal CARGO_TERM_COLOR=never pin must be present");
+        let user_ci = cmd
+            .find("export CI=user-override;")
+            .expect("user override of CI must be exported");
+        assert!(
+            internal_ci < user_ci,
+            "internal CI pin must come before user override so user wins"
+        );
+        assert!(
+            internal_no_color < user_ci,
+            "internal CARGO_TERM_COLOR pin must come before user exports too"
+        );
     }
 
     #[test]
