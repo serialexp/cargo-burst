@@ -40,8 +40,12 @@ pub struct BuildArgs {
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Args forwarded verbatim to `cargo` on the remote. Defaults to
-    /// `["build"]` when none are supplied.
-    #[arg(last = true)]
+    /// `["build"]` when none are supplied. The leading `--` is
+    /// optional: `cargo burst build --release -p foo` and
+    /// `cargo burst build -- --release -p foo` both work. Use the
+    /// explicit `--` when you need to pass something that would
+    /// otherwise look like a burst flag (e.g. `--no-fetch`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

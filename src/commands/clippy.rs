@@ -37,8 +37,13 @@ pub struct ClippyArgs {
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Args forwarded verbatim to `cargo` on the remote. Defaults to
-    /// `["clippy"]` when none are supplied.
-    #[arg(last = true)]
+    /// `["clippy"]` when none are supplied. The leading `--` is
+    /// optional: `cargo burst clippy --all-targets` and
+    /// `cargo burst clippy -- --all-targets` both work. An *inner*
+    /// `--` is still meaningful — it's clippy's own separator
+    /// between cargo args and lint args, e.g.
+    /// `cargo burst clippy --all-targets -- -D warnings`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

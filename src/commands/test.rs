@@ -58,7 +58,12 @@ pub struct TestArgs {
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Args forwarded verbatim to the test runner on the remote.
-    #[arg(last = true)]
+    /// The leading `--` is optional: `cargo burst test --test foo`
+    /// and `cargo burst test -- --test foo` both work. An *inner*
+    /// `--` is still meaningful — it's the separator between cargo
+    /// args and test-runner args, e.g.
+    /// `cargo burst test --release -- --nocapture`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

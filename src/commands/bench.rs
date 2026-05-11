@@ -51,8 +51,12 @@ pub struct BenchArgs {
     /// `forward_env` config field on a name conflict.
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Args forwarded verbatim to `cargo bench` on the remote.
-    #[arg(last = true)]
+    /// Args forwarded verbatim to `cargo bench` on the remote. The
+    /// leading `--` is optional: `cargo burst bench --bench foo`
+    /// and `cargo burst bench -- --bench foo` both work. An *inner*
+    /// `--` is still meaningful — it's the separator between cargo
+    /// args and benchmark-runner args (criterion etc).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

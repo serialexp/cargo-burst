@@ -51,12 +51,14 @@ pub struct RunArgs {
     /// conflict.
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Args forwarded verbatim to `cargo` on the remote. The first
-    /// `--` separates cargo-burst's own flags from cargo's; cargo's
-    /// own `--` (separating `cargo run` args from binary args) goes
-    /// inside this section. Defaults to `["run"]` when none are
-    /// supplied.
-    #[arg(last = true)]
+    /// Args forwarded verbatim to `cargo` on the remote. The leading
+    /// `--` is optional: `cargo burst run --release --bin foo` and
+    /// `cargo burst run -- --release --bin foo` both work. An *inner*
+    /// `--` (separating `cargo run` args from the binary's argv) is
+    /// preserved, so `cargo burst run --release --bin foo -- arg1
+    /// arg2` works the way you'd expect. Defaults to `["run"]` when
+    /// none are supplied.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

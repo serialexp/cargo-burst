@@ -34,8 +34,12 @@ pub struct CheckArgs {
     #[arg(long = "env", value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Args forwarded verbatim to `cargo` on the remote. Defaults to
-    /// `["check"]` when none are supplied.
-    #[arg(last = true)]
+    /// `["check"]` when none are supplied. The leading `--` is
+    /// optional: `cargo burst check -p foo --all-targets` and
+    /// `cargo burst check -- -p foo --all-targets` both work.
+    /// Use the explicit `--` when you need to pass something that
+    /// would otherwise look like a burst flag (e.g. `--no-fetch`).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub cargo_args: Vec<String>,
 }
 

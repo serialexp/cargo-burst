@@ -77,13 +77,18 @@ cargo burst bench                  # criterion HTML reports rsynced back
 | `cargo burst down`           | deletes the running server (volumes kept) | (use `--with-volumes` to delete all volumes too) |
 | `cargo burst image build`    | bakes a fresh base image                 | —                                             |
 
-Args after `--` go to cargo verbatim:
+Args go to cargo verbatim — the leading `--` is **optional**:
 
 ```sh
-cargo burst test -- --test integration   # nextest filter
-cargo burst build -- --release --features=foo
-cargo burst clippy -- --all-targets -- -D warnings   # lint args after the second --
+cargo burst test --test integration            # nextest filter
+cargo burst build --release --features=foo
+cargo burst clippy --all-targets -- -D warnings # inner -- still routes to clippy's lint args
 ```
+
+The explicit `cargo burst test -- --test integration` form still
+works if you prefer it, and you'll *want* it when you need to pass
+something that would otherwise look like a burst flag (e.g.
+`cargo burst build -- --no-fetch some-feature-flag`).
 
 Common flags on every run-subcommand:
 - `--keep-alive SECONDS` — override server idle timer for this run
