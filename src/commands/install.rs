@@ -32,52 +32,77 @@ Reach for `cargo burst` instead of plain `cargo` when:
 - The user has just made changes that touch many crates and wants to verify everything still compiles (`cargo burst check`)
 - You're about to run benchmarks — bench numbers are only comparable on consistent hardware (`cargo burst bench`)
 - A clippy gate is being run as a CI parity check (`cargo burst clippy`)
+- A binary is embarrassingly parallel / CPU-bound and would gain meaningfully from 48 cores instead of the laptop's (`cargo burst run`)
 
 Do **not** silently switch to `cargo burst` if the user said `cargo`. They might be intentionally testing locally (e.g. with hardware-specific features, debugging a remote-vs-local discrepancy, or running a binary that needs their local network/files).
 
-### Subcommands
+### Subcommands (complete list)
 
-| Command                       | What it runs on the remote               | Fetches back                                         |
-|-------------------------------|------------------------------------------|------------------------------------------------------|
-| `cargo burst build [args]`    | `cargo build [args]`                     | top-level files in `target/<profile>/`               |
-| `cargo burst test [args]`     | `cargo nextest run` + `cargo test --doc` | nothing                                              |
-| `cargo burst check [args]`    | `cargo check [args]`                     | nothing                                              |
-| `cargo burst clippy [args]`   | `cargo clippy [args]`                    | nothing                                              |
-| `cargo burst bench [args]`    | `cargo bench [args]`                     | `target/criterion/` recursively (if it exists)       |
-| `cargo burst status`          | —                                        | shows what's provisioned + last-used per project     |
-| `cargo burst down`            | deletes the running server               | volume is preserved (until volume reaper fires)      |
-| `cargo burst image build`     | bakes a fresh base image                 | —                                                    |
+Run-subcommands — execute a cargo verb on the remote, output streams back live:
+
+| Command                       | What it runs on the remote                                                       | Fetches back                                         |
+|-------------------------------|----------------------------------------------------------------------------------|------------------------------------------------------|
+| `cargo burst build [args]`    | `cargo build [args]`                                                             | top-level files in `target/<profile>/`               |
+| `cargo burst test [args]`     | `cargo nextest run` + `cargo test --doc` (doctest pass auto-skipped if args contain `--test`/`--bin`/`--example`/`--bench` or their plurals, or if the workspace has no library targets) | nothing                                              |
+| `cargo burst check [args]`    | `cargo check [args]`                                                             | nothing                                              |
+| `cargo burst clippy [args]`   | `cargo clippy [args]`                                                            | nothing                                              |
+| `cargo burst bench [args]`    | `cargo bench [args]`                                                             | `target/criterion/` recursively (if it exists)       |
+| `cargo burst run [args]`      | `cargo run [args]` — build + execute the binary on the CCX63; stdout/stderr stream back, stdin is closed (no TTY allocation for the binary). Useful for embarrassingly-parallel CPU-bound runs (parameter sweeps, big one-offs, perf debugging). File outputs stay on the remote unless you rsync them yourself. | nothing                                              |
+
+Management subcommands (no remote cargo phase):
+
+| Command                          | What it does                                                                              |
+|----------------------------------|-------------------------------------------------------------------------------------------|
+| `cargo burst status`             | Show what's currently provisioned (server, volumes, last-used per project, current cost). |
+| `cargo burst audit [--rate EUR_PER_HOUR]` | Summarize the lifecycle log: session count, cold-vs-warm timings, wall-time split (provision/sync/cargo), per-verb means, churn buckets (10/30/60-min terminate→reprovision pairs), and a keep-alive what-if model. Pass `--rate` to get cost figures alongside wall-time. |
+| `cargo burst down [--with-volumes]` | Delete the running server now. Volumes are preserved by default; `--with-volumes` deletes all project volumes too (clean slate). |
+| `cargo burst image build`        | Bake a fresh base image (Ubuntu + rust + mold + sccache + nextest + postgres/mysql/redis). One-time per toolchain refresh, ~5–10 min. |
+| `cargo burst install`            | Refresh this instructions block in `~/.claude/CLAUDE.md` (re-run after upgrading cargo-burst). |
 
 ### Forwarding cargo args
 
-Args after `--` go to cargo verbatim. Note the subcommand already supplies the cargo verb, so don't repeat it:
+The leading `--` is **optional** — args are forwarded to cargo verbatim. Both forms work:
 
 ```
+cargo burst build --release --features=foo
 cargo burst build -- --release --features=foo
-cargo burst test -- --test integration_tests
-cargo burst test -- --release -- --nocapture           # second `--` for test-runner args
-cargo burst clippy -- --all-targets -- -D warnings     # second `--` for clippy lint args
+cargo burst test --test integration_tests
+cargo burst run --release --bin solver -- --threads 48     # inner -- routes to binary's argv
+cargo burst clippy --all-targets -- -D warnings           # inner -- routes to clippy lint args
+cargo burst test --release -- --nocapture                 # inner -- routes to test-runner args
 ```
+
+Use the explicit leading `--` only when you need to pass something that would otherwise look like a burst-specific flag (e.g. `cargo burst build -- --no-fetch some-feature` — rare).
 
 ### Common flags (on every run-subcommand)
 
-- `--keep-alive SECONDS` — override the server idle timer for this run
-- `--no-reap` — don't schedule auto-deletion (server + volume stay alive until `cargo burst down`)
-- `--no-fetch` — skip the artifact rsync (build, bench)
-- `--yes` — skip the first-run "apply suggested rsync excludes?" prompt
+- `--keep-alive SECONDS` — override the server idle timer for this run.
+- `--no-reap` — don't schedule auto-deletion; server + volume stay alive until `cargo burst down`.
+- `--no-fetch` — skip the artifact rsync (only meaningful for `build` and `bench`).
+- `--yes` — skip the first-run "apply suggested rsync excludes?" prompt.
+- `--env VAR[=VALUE]` — forward an environment variable. `--env RUST_LOG` forwards your local `$RUST_LOG` value; `--env DATABASE_URL=postgres://…` sets it verbatim. Repeatable. Use for DATABASE_URL / REDIS_URL / etc. that integration tests need.
+
+Test-only flags:
+
+- `--no-doctests` — skip the `cargo test --doc` pass after nextest.
+- `--cargo-test` — use plain `cargo test` instead of nextest (rare; only when tests have nextest-incompatible fixtures).
 
 ### Things to know
 
-- **Source is rsync'd, not mounted.** Files written remotely (e.g. by build scripts) don't appear locally unless the subcommand fetches them. `target/` lives on the remote volume; only the explicit fetch step pulls things back.
-- **Arch warning on macOS hosts.** `cargo burst build` will warn that the fetched binary is `linux-x86_64` and won't run locally. Pass `--no-fetch` if the user only cared about exercising the build, not getting a runnable binary.
-- **Test failures skip doctests.** `cargo burst test` runs nextest first; if any tests fail it bails before `cargo test --doc`. The user already knows the suite is broken at that point.
+- **`run` is fully supported** and is the right tool when the user has a CPU-bound binary they want to run on 48 cores. It does not fetch any file outputs back — if the binary writes results to disk, they stay on the remote (the user can `cargo burst run -- … --output /tmp/out.json` then handle retrieval separately).
+- **Source is rsync'd, not mounted.** Files written remotely (e.g. by build scripts or `cargo burst run`) don't appear locally. `target/` lives on the remote volume; only `build`'s and `bench`'s explicit fetch step pulls things back.
+- **Arch warning on macOS hosts.** `cargo burst build` warns that the fetched binary is `linux-x86_64` and won't run locally. Pass `--no-fetch` if the user only cared about exercising the build, not getting a runnable binary.
+- **Test failures skip doctests.** `cargo burst test` runs nextest first; if any tests fail it bails before `cargo test --doc`.
+- **Integration DBs are pre-provisioned.** `cargo burst test` and `cargo burst bench` block until postgres (5432), mysql (3306), and redis (6379) are reachable on the remote. Connection strings: `postgres://postgres@localhost:5432/postgres` (no password, trust auth), `mysql://root:root@localhost:3306/`, `redis://localhost:6379/`. Pass `--env DATABASE_URL=…` to forward the connection string the tests expect. DB data lives on the server's root disk and is reset on every cold boot.
 - **First-run prompt.** Initial sync into a project prompts to confirm rsync excludes. Pass `--yes` to bypass when scripting.
-- **Output streams live.** stdout/stderr from cargo come back over the SSH session in real time — you see the same compiler errors and test output you would locally.
+- **Output streams live.** stdout/stderr from cargo come back over the SSH session in real time.
+- **Killing locally kills remotely.** Ctrl-C / SIGTERM on cargo-burst propagates to the remote cargo process; you don't leave orphan builds running on the paid VM.
+- **Per-project config.** `<workspace>/.config/cargo-burst.toml` can override `server_type`, `volume_gb`, `forward_env`, `unexclude`, `extra_excludes`. Check there if a project sets `forward_env = [...]` to know what env you should pass via `--env`.
 
 ### When NOT to suggest cargo burst
 
 - The user is debugging something local-environment-specific (PATH, env vars, native deps installed only on their box).
-- The task is `cargo run` of a binary that opens a port, reads local files, or otherwise expects to be on the user's machine.
+- The binary opens a port that should be reachable from the user's local browser/curl, reads local files outside the workspace, or otherwise expects to be on the user's machine. (`cargo burst run` puts the binary on a remote IP.)
 - The build is fast enough that SSH+rsync overhead would make `cargo burst` slower than just running locally (small crates, single-file changes with a warm local cache).
 - The user is iterating very tightly and doesn't have an active `cargo burst` server warm — every cold start adds ~30s of provisioning.
 "##;
