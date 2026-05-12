@@ -328,11 +328,26 @@ pub async fn run_remote_capturing(
     // and stderr in the order lines actually appear on the wire is
     // what we want for hint detection (panic backtraces span both).
     let captured: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    // Cancellation watchdog: nextest prints `Cancelling due to test
+    // failure: N test(s) still running` once it decides to bail (after
+    // a fail-fast trigger). It then waits for the stragglers to exit —
+    // first SIGTERM, then SIGKILL after a hardcoded ~10s grace. If a
+    // straggler is wedged (D-state in the kernel, holding a refcount
+    // on a PTY slave fd, etc.) the whole `cargo nextest` invocation
+    // hangs and so do we. We watch for the message in the live stream
+    // and, if the child hasn't exited within a generous grace period
+    // after, force-kill the local ssh — which closes the channel,
+    // which (with `-tt`) makes sshd SIGHUP the remote shell.
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
     let cap_out = captured.clone();
+    let cancel_tx_out = cancel_tx.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             println!("{line}");
+            if line.contains("Cancelling due to test failure") {
+                let _ = cancel_tx_out.send(true);
+            }
             if let Ok(mut g) = cap_out.lock() {
                 g.push_str(&line);
                 g.push('\n');
@@ -340,22 +355,69 @@ pub async fn run_remote_capturing(
         }
     });
     let cap_err = captured.clone();
+    let cancel_tx_err = cancel_tx.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             eprintln!("{line}");
+            if line.contains("Cancelling due to test failure") {
+                let _ = cancel_tx_err.send(true);
+            }
             if let Ok(mut g) = cap_err.lock() {
                 g.push_str(&line);
                 g.push('\n');
             }
         }
     });
+    // Drop our own sender so the watch closes cleanly if the readers
+    // exit; we still have the two clones living inside the tasks.
+    drop(cancel_tx);
     // Grab abort handles before consuming the JoinHandles in the
     // timeout below — once `await`ed (even inside a timeout), the
     // JoinHandle is moved and we can't reach back to abort the task.
     let stdout_abort = stdout_task.abort_handle();
     let stderr_abort = stderr_task.abort_handle();
-    let status = child.wait().await.context("waiting on ssh")?;
+    // Race the child exit against the cancellation watchdog. The
+    // 60s grace is deliberately generous: nextest's internal escalation
+    // is SIGTERM → 10s → SIGKILL, plus a brief reap, so a healthy
+    // cancellation completes in <15s. Anything past 60s is a hard hang
+    // — almost always a D-state task that won't even die on SIGKILL,
+    // at which point our only move is to drop the ssh channel and
+    // let the user `cargo burst down` to wipe the server.
+    let cancel_grace = std::time::Duration::from_secs(60);
+    let status = tokio::select! {
+        s = child.wait() => s.context("waiting on ssh")?,
+        _ = async {
+            // First wait for the cancel signal …
+            loop {
+                if *cancel_rx.borrow() { break; }
+                if cancel_rx.changed().await.is_err() {
+                    // All senders dropped without ever signalling
+                    // cancel — readers EOF'd cleanly, child.wait()
+                    // will resolve any moment. Park forever and let
+                    // the other arm of the select win.
+                    std::future::pending::<()>().await;
+                }
+            }
+            // … then give the run that long to terminate on its own.
+            tokio::time::sleep(cancel_grace).await;
+        } => {
+            tracing::warn!(
+                grace_secs = cancel_grace.as_secs(),
+                "nextest signalled cancellation but the run didn't exit within grace; \
+                 killing ssh (a remote test is wedged and unkillable — likely D-state). \
+                 Run `cargo burst down` if the remote stays busy."
+            );
+            eprintln!(
+                "\ncargo-burst: nextest cancelled {}s ago but the run is still going. \
+                 Forcing ssh close — a remote test process is wedged. If the remote \
+                 stays busy after this, run `cargo burst down` to wipe the server.",
+                cancel_grace.as_secs()
+            );
+            let _ = child.kill().await;
+            child.wait().await.context("waiting on ssh after force-kill")?
+        }
+    };
     // Defense in depth: ssh has exited, so its stdout/stderr pipes
     // should EOF and our reader tasks should drain in milliseconds.
     // If they're still pending after a short grace period something
