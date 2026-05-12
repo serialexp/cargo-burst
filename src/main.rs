@@ -13,6 +13,7 @@ mod commands;
 mod config;
 mod hcloud;
 mod hints;
+mod pipe_guard;
 mod project;
 mod ssh;
 

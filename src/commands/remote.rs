@@ -104,6 +104,19 @@ where
     F: FnOnce(RemoteCtx) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
+    // Refuse to run if stdout is piped into a tool that buffers
+    // everything until EOF (`tail -60`, `wc`, `sort`, etc.). Those
+    // consumers — common in agent invocations bounding context — hide
+    // every byte cargo-burst emits during the run, making a normal
+    // multi-minute build look identical to a hang. Fail fast in <100ms
+    // with a message that explains the workaround; tail's window will
+    // flush our error when we exit, so even an agent reading through
+    // `| tail -60` ends up seeing what went wrong. Linux-only; on
+    // macOS the detection no-ops and we proceed unchanged.
+    if let Some(consumer) = crate::pipe_guard::detect_buffering_pipe_consumer() {
+        return Err(anyhow!(crate::pipe_guard::buffering_pipe_error(&consumer)));
+    }
+
     let cwd = std::env::current_dir().context("getting current dir")?;
     let project = ProjectKey::discover(&cwd)?;
     tracing::info!(
