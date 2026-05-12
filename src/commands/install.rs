@@ -53,7 +53,7 @@ Management subcommands (no remote cargo phase):
 
 | Command                          | What it does                                                                              |
 |----------------------------------|-------------------------------------------------------------------------------------------|
-| `cargo burst status`             | Show what's currently provisioned (server, volumes, last-used per project, current cost). |
+| `cargo burst status`             | Show what's currently provisioned (server, volumes, last-used per project, current cost) **plus** a live snapshot of the top 10 processes by CPU on the remote, with PIDs. Use this *first* when a build feels slow — the PID columns show exactly what to kill (`ssh work@<ip> kill <PID>`) without nuking the whole server. |
 | `cargo burst audit [--rate EUR_PER_HOUR]` | Summarize the lifecycle log: session count, cold-vs-warm timings, wall-time split (provision/sync/cargo), per-verb means, churn buckets (10/30/60-min terminate→reprovision pairs), and a keep-alive what-if model. Pass `--rate` to get cost figures alongside wall-time. |
 | `cargo burst down [--with-volumes]` | Delete the running server now. Volumes are preserved by default; `--with-volumes` deletes all project volumes too (clean slate). |
 | `cargo burst image build`        | Bake a fresh base image (Ubuntu + rust + mold + sccache + nextest + postgres/mysql/redis). One-time per toolchain refresh, ~5–10 min. |

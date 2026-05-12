@@ -97,11 +97,9 @@ pub async fn run() -> Result<()> {
     // know what's on offer even when no server is up); when a server
     // *is* up, probe the ports and annotate each line with up/down.
     println!("databases:");
-    let probe = if let Some(ip) = server_ip.as_deref() {
-        match cfg.ssh_key_path() {
-            Ok(key) => probe_db_ports(ip, &key).await,
-            Err(_) => None,
-        }
+    let key_path = cfg.ssh_key_path().ok();
+    let probe = if let (Some(ip), Some(key)) = (server_ip.as_deref(), key_path.as_deref()) {
+        probe_db_ports(ip, key).await
     } else {
         None
     };
@@ -117,6 +115,34 @@ pub async fn run() -> Result<()> {
         println!("  [{state_str}] {name:<8}  {conn}");
     }
     println!();
+
+    // Top processes — what's actually eating CPU on the remote right
+    // now. The "agent runs `cargo burst status` to see why a build
+    // feels slow" use case needs this concretely: with PIDs in hand,
+    // a user can `cargo burst down` for a hard reset or
+    // `ssh work@<ip> kill <pid>` for a targeted clear. Skipped when
+    // no server is up — there are no processes to list.
+    if let (Some(ip), Some(key)) = (server_ip.as_deref(), key_path.as_deref()) {
+        match fetch_top_processes(ip, key).await {
+            Some(text) if !text.trim().is_empty() => {
+                println!("top processes (by CPU, snapshot):");
+                for line in text.lines() {
+                    println!("  {line}");
+                }
+                println!("  (kill via: ssh work@{ip} kill <PID>  — or `cargo burst down` for a clean slate)");
+                println!();
+            }
+            Some(_) => {
+                // ps returned nothing — extremely unusual but
+                // possible on a freshly-booted server before
+                // anything spawned. Suppress quietly.
+            }
+            None => {
+                println!("top processes: (probe failed — server may be mid-init)");
+                println!();
+            }
+        }
+    }
 
     if state.projects.is_empty() {
         println!("(no projects registered yet)");
@@ -155,6 +181,40 @@ pub async fn run() -> Result<()> {
 /// error and we'd report nothing. We use `timeout 1` per port so a
 /// hung service can't stretch the status command's wall time past
 /// ~3 s in the worst case.
+/// SSH to the remote and snapshot the top 10 processes by CPU. Returns
+/// the raw text — header line first, then one process per line — so
+/// the caller can render it verbatim. Returns `None` if the SSH probe
+/// itself fails.
+///
+/// We use `ps -e` (every process, including other users') because
+/// `cargo burst run` and Hetzner cloud-init bring up things under
+/// multiple uids that all count toward "what's keeping this box
+/// busy". The column set — `pid,user,pcpu,pmem,etime,args` — gives
+/// an agent enough to act on:
+///   - `pid` for `kill <pid>`
+///   - `user` to spot processes the build user spawned vs. system
+///   - `pcpu`/`pmem` to see what's actually loaded
+///   - `etime` (elapsed wall time) to spot a long-runaway job vs. a
+///     short spike
+///   - `args` (full command line) to identify which crate or binary
+///     this rustc/cargo invocation belongs to
+///
+/// `--sort=-pcpu` orders highest-CPU first; `head -11` keeps the
+/// header plus 10 rows. `cut -c1-220` truncates pathologically long
+/// rustc command lines (frequently >2 KB) at a width that's still
+/// usable for identification.
+///
+/// `2>/dev/null || true` on the outer pipe so transient ps failures
+/// (e.g. a process disappearing mid-snapshot) don't take down the
+/// whole status command.
+async fn fetch_top_processes(host: &str, key_path: &std::path::Path) -> Option<String> {
+    let script = "ps -eo pid,user,pcpu,pmem,etime,args --sort=-pcpu 2>/dev/null \
+                  | head -11 \
+                  | cut -c1-220 \
+                  || true";
+    ssh::capture_remote(host, "work", key_path, script).await.ok()
+}
+
 async fn probe_db_ports(host: &str, key_path: &std::path::Path) -> Option<Vec<(String, bool)>> {
     // Single-quote the bash heredoc so the local shell doesn't expand
     // anything. The remote shell does all the variable expansion.
