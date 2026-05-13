@@ -931,6 +931,14 @@ fn should_prompt_excludes(first_run: bool, auto_yes: bool, interactive: bool) ->
 /// fine; just untidy log output otherwise). Returned in deterministic
 /// order so the size scanner and rsync see the same set.
 ///
+/// Matching is **trailing-slash-insensitive**: the built-in defaults
+/// are written in gitignore syntax (`.git/`, `target/`, …) but to a
+/// user `.git` and `.git/` mean the same thing. Requiring the exact
+/// gitignore form makes the config a footgun — you write `.git` in
+/// `unexclude`, nothing happens, and the only signal is a warning
+/// that looks like the entry is bogus. Normalize both sides by
+/// stripping a single trailing slash before comparing.
+///
 /// Side effect: warns once for each `cfg.unexclude` entry that doesn't
 /// match a default — almost always a typo, occasionally a stale entry
 /// from a future where the default list was different. Non-fatal so
@@ -939,12 +947,15 @@ fn build_merged_excludes(cfg: &Config, user: &[String]) -> Vec<String> {
     let unexclude: &[String] = &cfg.unexclude;
     let mut out: Vec<String> = Vec::new();
     for d in ssh::DEFAULT_EXCLUDES {
-        if !unexclude.iter().any(|u| u == d) {
+        if !unexclude.iter().any(|u| unexclude_matches_default(u, d)) {
             out.push((*d).to_string());
         }
     }
     for u in unexclude {
-        if !ssh::DEFAULT_EXCLUDES.iter().any(|d| d == u) {
+        if !ssh::DEFAULT_EXCLUDES
+            .iter()
+            .any(|d| unexclude_matches_default(u, d))
+        {
             tracing::warn!(
                 pattern = %u,
                 "`unexclude` entry doesn't match any built-in default; \
@@ -957,6 +968,16 @@ fn build_merged_excludes(cfg: &Config, user: &[String]) -> Vec<String> {
     }
     out.extend(user.iter().cloned());
     out
+}
+
+/// Compare a user-supplied `unexclude` entry against a built-in default
+/// pattern, ignoring a single trailing slash on either side. Pure
+/// function so the slash-normalization rule is unit-testable. We
+/// strip *all* trailing slashes (so `.git//` and `.git/` both match
+/// `.git/`) — a genuinely malformed pattern is more usefully treated
+/// as the same thing than as a separate typo.
+fn unexclude_matches_default(user: &str, default_pat: &str) -> bool {
+    user.trim_end_matches('/') == default_pat.trim_end_matches('/')
 }
 
 fn build_matcher(root: &Path, patterns: &[String]) -> Result<ignore::gitignore::Gitignore> {
@@ -1384,6 +1405,44 @@ mod tests {
     #[test]
     fn label_to_verb_canonicalizes_test() {
         assert_eq!(label_to_verb("Tests"), "test");
+    }
+
+    #[test]
+    fn unexclude_matches_default_ignores_trailing_slash() {
+        // Either side may or may not have a trailing slash; semantic
+        // equality should hold across all four combinations.
+        assert!(unexclude_matches_default(".git", ".git/"));
+        assert!(unexclude_matches_default(".git/", ".git/"));
+        assert!(unexclude_matches_default(".git/", ".git"));
+        assert!(unexclude_matches_default(".git", ".git"));
+        assert!(unexclude_matches_default("target", "target/"));
+        assert!(unexclude_matches_default("node_modules", "node_modules/"));
+        // Multiple trailing slashes collapse (malformed but harmless).
+        assert!(unexclude_matches_default(".git//", ".git/"));
+    }
+
+    #[test]
+    fn unexclude_matches_default_rejects_unrelated() {
+        assert!(!unexclude_matches_default(".gitignore", ".git/"));
+        assert!(!unexclude_matches_default("target", "node_modules/"));
+        assert!(!unexclude_matches_default("", ".git/"));
+    }
+
+    #[test]
+    fn build_merged_excludes_strips_default_for_dot_git_without_slash() {
+        // The bug we're fixing: `unexclude = [".git"]` (no trailing
+        // slash) used to fail to match `.git/` in DEFAULT_EXCLUDES and
+        // .git/ would still be excluded. Now it should drop out of
+        // the merged list.
+        let mut cfg = cfg_with("nbg1", &[]);
+        cfg.unexclude = vec![".git".into()];
+        let merged = build_merged_excludes(&cfg, &[]);
+        assert!(
+            !merged.iter().any(|p| p == ".git/" || p == ".git"),
+            "expected .git/ to be removed by unexclude = [\".git\"]; got {merged:?}"
+        );
+        // Sanity: other defaults are still present.
+        assert!(merged.iter().any(|p| p == "target/"));
     }
 
     #[test]
