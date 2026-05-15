@@ -22,7 +22,14 @@ const END_MARKER: &str = "<!-- cargo-burst:end -->";
 /// `cargo burst install` to pick up the new copy.
 const INSTRUCTIONS: &str = r##"## cargo-burst
 
-You have access to the `cargo-burst` CLI tool, which runs cargo commands on a remote Hetzner Cloud server (CCX63: 48 dedicated cores, 192 GB RAM) with a persistent per-project volume that keeps `target/` and the sccache directory warm between sessions. The user prefers this for big Rust builds because their local machine is slower and they don't want to heat the room.
+You have access to the `cargo-burst` CLI tool, which runs cargo commands on a remote cloud server with a persistent per-project volume that keeps `target/` and the sccache directory warm between sessions. The user prefers this for big Rust builds because their local machine is slower and they don't want to heat the room.
+
+Two providers are supported (selected via `provider = "hetzner" | "aws"` in `~/.config/cargo-burst/config.toml`):
+
+- **Hetzner** (CCX63: 48 dedicated cores, 192 GB RAM) — 1-hour minimum billing increment. Cheapest for long sessions; expensive if you spin up/down a lot.
+- **AWS EC2** (e.g. `c7a.48xlarge`: 48-192 vCPU options, configurable) — per-second billing, spot by default (~70-80% off on-demand, 2-min interruption notice). Cheaper for cold-start-heavy workloads. CI-spawn churn that ran ~$360 on Hetzner cost ~$2-3 on AWS.
+
+Server-class strings, volume sizing, and region semantics live under `[hetzner]` / `[aws]` sections in `config.toml`. The user's active provider determines billing minimums (`cargo burst status` prints both).
 
 ### When to use cargo-burst
 

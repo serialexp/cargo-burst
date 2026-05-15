@@ -6,13 +6,11 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::hcloud::{
-    CreateServerRequest, HCloud, ImageRef,
-};
+use crate::provider::{self, ImageId, Provider, ServerId, ServerSpec, ServerStatus};
 use crate::ssh;
 
 /// Hard ceiling on the bake script's wall-clock runtime. The script
@@ -27,11 +25,14 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Args, Debug)]
 pub struct ImageBuildArgs {
-    /// Server type to use for the bake VM. Defaults to `cpx22` because
-    /// the bake is I/O- and download-bound, not CPU-bound — paying for a
-    /// dedicated-core VM here is wasted.
-    #[arg(long, default_value = "cpx22")]
-    pub bake_server_type: String,
+    /// Server type to use for the bake VM. Defaults are
+    /// provider-specific (`cpx22` on Hetzner, `m7a.large` on AWS).
+    /// AWS's `t3.medium` burstable was tried first and exhausted its
+    /// CPU credits during the rust toolchain + sccache compile phase;
+    /// `m7a.large` (2 vCPU sustained, 8 GB RAM) finishes the same
+    /// workload in ~10 min for roughly the same price-per-hour.
+    #[arg(long)]
+    pub bake_server_type: Option<String>,
     /// Description on the resulting snapshot. Defaults to a timestamped
     /// "cargo-burst <date>" so multiple snapshots are distinguishable.
     #[arg(long)]
@@ -47,62 +48,111 @@ const BAKE_SCRIPT: &str = include_str!("../../scripts/bake-image.sh");
 
 pub async fn run(args: ImageBuildArgs) -> Result<()> {
     let cfg = Config::load()?;
-    // Image bake is long-running; we touch state.json only at the very end
-    // to record the new image id. Don't load it now — `update_state` below
-    // re-reads under the lock at write time.
-    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
+    let provider = provider::from_config(&cfg).await?;
 
-    // 1. Local SSH key + register on Hetzner.
+    // 1. Local SSH key + register with provider.
     let ssh_key_path = cfg.ssh_key_path()?;
     tracing::info!(path = %ssh_key_path.display(), "ensuring local SSH key");
     let pubkey = ssh::ensure_ssh_key(&ssh_key_path).await?;
-    let hetzner_key = hcloud.ensure_ssh_key("cargo-burst", &pubkey).await?;
-    tracing::info!(id = hetzner_key.id, "ssh key registered with Hetzner");
+    let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
+    tracing::info!(id = %ssh_key_id, "ssh key registered with provider");
 
     // 2. Build user-data: substitute the public key into the bake script.
+    //    Note: the bake script is Hetzner-flavored (Ubuntu image name,
+    //    apt-based). Phase B will need a parallel AWS bake path.
     let user_data = BAKE_SCRIPT.replace("__CARGO_BURST_PUBKEY__", pubkey.trim());
 
-    // 3. Provision the bake server. We pass the bake script as user_data;
-    //    cloud-init runs it on first boot. We never ssh in during the bake
-    //    — the script runs to completion and powers the machine off,
-    //    which is our completion signal.
+    // 3. Provision the bake server. Cloud-init runs the script on first
+    //    boot. We never ssh in during the bake — the script runs to
+    //    completion and powers the machine off, which is our completion
+    //    signal.
+    //
+    //    On Hetzner the bake uses a base Ubuntu image, identified by the
+    //    well-known name "ubuntu-24.04". We pass it through the provider
+    //    trait's ImageId which here happens to be that string rather
+    //    than a snapshot id — `HcloudProvider::create_server` parses the
+    //    ImageId as an i64 ID, which "ubuntu-24.04" obviously isn't, so
+    //    bake currently still talks to the HCloud client directly via
+    //    the create_server path. We accept this temporary leakage: bake
+    //    is Hetzner-flavored end-to-end (apt commands in the script),
+    //    so we don't claim cross-provider parity here. The trait-only
+    //    path comes back online once we have a baked snapshot ID.
     let server_name = format!(
         "cargo-burst-bake-{}",
         time::OffsetDateTime::now_utc()
             .format(&time::format_description::parse("[year][month][day]-[hour][minute][second]")?)
             .unwrap_or_else(|_| "now".into())
     );
-    let mut labels = HashMap::new();
+    let mut labels = BTreeMap::new();
     labels.insert("managed-by".into(), "cargo-burst".into());
+    // `role=bake` is load-bearing: Ec2Provider routes labelled bake
+    // servers to on-demand regardless of `use_spot` (one-shot, must
+    // succeed). Don't drop this label without also revisiting that
+    // dispatch.
     labels.insert("role".into(), "bake".into());
 
-    tracing::info!(name = %server_name, server_type = %args.bake_server_type, "provisioning bake VM");
-    let create = hcloud
-        .create_server(CreateServerRequest {
+    // Pick the bake instance/server type. Default depends on the
+    // provider: cpx22 on Hetzner, m7a.large on AWS. The bake does
+    // sustained-CPU work (rust toolchain compile, sccache build) so
+    // a burstable t3 class isn't viable here — it ran out of credits
+    // before completing.
+    let bake_server_type = args.bake_server_type.clone().unwrap_or_else(|| {
+        match provider.name() {
+            "aws" => "m7a.large".to_string(),
+            _ => "cpx22".to_string(),
+        }
+    });
+
+    // Image-bake "image" is the base OS — Hetzner accepts the name
+    // "ubuntu-24.04" as an image reference. We stuff that into the
+    // ImageId newtype and the HcloudProvider's create_server path
+    // detects the non-numeric form. (Implementation note: we wrap it
+    // in ImageId here and HcloudProvider parses it specially.)
+    //
+    // For now Phase A keeps image-bake Hetzner-only and uses the
+    // underlying client directly via a thin internal helper on the
+    // provider type. To avoid leaking that, we go through a
+    // bake-specific path: most providers offer a "bake from base OS"
+    // primitive, but the API surface differs enough that we keep it
+    // in the impl rather than the public trait.
+    tracing::info!(
+        name = %server_name,
+        server_type = %bake_server_type,
+        provider = %provider.name(),
+        "provisioning bake VM"
+    );
+    // We pass the well-known base-image name as a magic ImageId
+    // string; both `HcloudProvider` and `Ec2Provider` detect the
+    // "ubuntu-24.04" magic name and translate it (hcloud image
+    // reference on Hetzner; SSM-parameter-store AMI lookup on AWS).
+    let create = match provider
+        .create_server(ServerSpec {
             name: server_name.clone(),
-            server_type: args.bake_server_type.clone(),
-            image: ImageRef::Name("ubuntu-24.04".into()),
-            // Image bake uses the user's first-preference region. No
-            // capacity fallback here: this is a manual, one-shot
-            // operation, and if that region is full the user can
-            // simply wait or re-run after rotating their config.
-            location: cfg.region_preference().remove(0),
-            ssh_keys: vec![hetzner_key.id],
-            volumes: vec![],
+            server_type: bake_server_type.clone(),
+            image: ImageId("ubuntu-24.04".into()),
+            region: cfg.region_preference().remove(0),
+            ssh_keys: vec![ssh_key_id.clone()],
             user_data: Some(user_data),
             labels,
-            start_after_create: true,
+            attached_volumes: Vec::new(),
         })
-        .await?;
-    let server_id = create.server.id;
+        .await
+    {
+        Ok(info) => info,
+        Err(crate::provider::ProvisionError::NoCapacity { regions, .. }) => {
+            return Err(anyhow!(
+                "bake region {:?} is at capacity; pass --region or try later",
+                regions
+            ));
+        }
+        Err(crate::provider::ProvisionError::Other(e)) => return Err(e),
+    };
+    let server_id = create.id.clone();
     let server_ip = create
-        .server
-        .public_net
-        .ipv4
-        .as_ref()
-        .map(|i| i.ip.clone())
+        .public_ip
+        .clone()
         .unwrap_or_else(|| "<no-ipv4>".into());
-    tracing::info!(id = server_id, ip = %server_ip, "bake VM provisioned");
+    tracing::info!(id = %server_id, ip = %server_ip, "bake VM provisioned");
     println!();
     println!("  bake VM:     id={server_id}  ip={server_ip}");
     println!("  watch log:   http://{server_ip}:8473/cargo-burst-bake.log");
@@ -111,16 +161,22 @@ pub async fn run(args: ImageBuildArgs) -> Result<()> {
 
     // From here on, any failure must clean up the bake server (unless the
     // user passed --keep-on-failure).
-    let bake_outcome = run_bake_inner(&hcloud, server_id, args.description.as_deref()).await;
+    let bake_outcome = run_bake_inner(
+        provider.as_ref(),
+        &server_id,
+        args.description.as_deref(),
+    )
+    .await;
 
     match &bake_outcome {
         Ok(image_id) => {
-            tracing::info!(image_id, "snapshot ready; deleting bake VM");
-            if let Err(e) = hcloud.delete_server(server_id).await {
+            tracing::info!(image_id = %image_id, "snapshot ready; deleting bake VM");
+            if let Err(e) = provider.delete_server(&server_id).await {
                 tracing::warn!("failed to delete bake VM {server_id}: {e}");
             }
-            crate::config::update_state(|s| {
-                s.image_id = Some(*image_id);
+            let image_id_clone = image_id.clone();
+            crate::config::update_state(move |s| {
+                s.image_id = Some(image_id_clone);
                 Ok(())
             })
             .await?;
@@ -131,18 +187,11 @@ pub async fn run(args: ImageBuildArgs) -> Result<()> {
             if args.keep_on_failure {
                 tracing::error!(
                     "bake failed; leaving server {server_id} alive for debugging \
-                     (ssh work@{}). Error: {e}",
-                    create
-                        .server
-                        .public_net
-                        .ipv4
-                        .as_ref()
-                        .map(|i| i.ip.as_str())
-                        .unwrap_or("?"),
+                     (ssh work@{server_ip}). Error: {e}"
                 );
             } else {
                 tracing::error!("bake failed; deleting server {server_id}. Error: {e}");
-                if let Err(e2) = hcloud.delete_server(server_id).await {
+                if let Err(e2) = provider.delete_server(&server_id).await {
                     tracing::warn!("failed to delete bake VM {server_id}: {e2}");
                 }
             }
@@ -156,22 +205,25 @@ pub async fn run(args: ImageBuildArgs) -> Result<()> {
 /// cloud-init script ran to completion), then snapshot. Returns the new
 /// image's ID on success.
 async fn run_bake_inner(
-    hcloud: &HCloud,
-    server_id: i64,
+    provider: &dyn Provider,
+    server_id: &ServerId,
     description: Option<&str>,
-) -> Result<i64> {
-    // 1. Wait for cloud-init to power the machine off. Hetzner exposes
-    //    server status: `running`, `off`, etc.
+) -> Result<ImageId> {
+    // 1. Wait for cloud-init to power the machine off.
     let bake_start = Instant::now();
     tracing::info!("waiting for bake script to finish (server will power off)");
-    let mut last_status = String::new();
+    let mut last_status: Option<String> = None;
     loop {
-        let server = hcloud.get_server(server_id).await?;
-        if server.status != last_status {
-            tracing::info!(status = %server.status, elapsed_secs = bake_start.elapsed().as_secs(), "bake VM status");
-            last_status = server.status.clone();
+        let server = provider
+            .get_server(server_id)
+            .await?
+            .ok_or_else(|| anyhow!("bake VM disappeared mid-bake"))?;
+        let status_str = server.status.as_str().to_string();
+        if last_status.as_deref() != Some(&status_str) {
+            tracing::info!(status = %status_str, elapsed_secs = bake_start.elapsed().as_secs(), "bake VM status");
+            last_status = Some(status_str.clone());
         }
-        if server.status == "off" {
+        if matches!(server.status, ServerStatus::Stopped) {
             tracing::info!(elapsed = ?bake_start.elapsed(), "bake script complete");
             break;
         }
@@ -179,14 +231,13 @@ async fn run_bake_inner(
             return Err(anyhow!(
                 "bake script did not complete within {:?} (server still {})",
                 BAKE_TIMEOUT,
-                server.status
+                status_str
             ));
         }
         tokio::time::sleep(Duration::from_secs(15)).await;
     }
 
-    // 2. Snapshot. Hetzner returns an action + the new image id immediately,
-    //    but the image won't be `available` until the snapshot finishes.
+    // 2. Snapshot.
     let description = description
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
@@ -199,17 +250,17 @@ async fn run_bake_inner(
         });
     tracing::info!(%description, "creating snapshot");
     let snap_start = Instant::now();
-    let create = hcloud
-        .create_image_from_server(server_id, &description)
+    let image_id = provider
+        .bake_image_from_server(server_id, &description)
         .await
         .context("creating image")?;
-    tracing::info!(image_id = create.image_id, action_id = create.action_id, "snapshot in progress");
+    tracing::info!(image_id = %image_id, "snapshot in progress");
 
-    hcloud
-        .wait_image_ready(create.image_id, SNAPSHOT_TIMEOUT)
+    provider
+        .wait_image_ready(&image_id, SNAPSHOT_TIMEOUT)
         .await
-        .with_context(|| format!("waiting for image {}", create.image_id))?;
+        .with_context(|| format!("waiting for image {image_id}"))?;
     tracing::info!(elapsed = ?snap_start.elapsed(), "snapshot ready");
 
-    Ok(create.image_id)
+    Ok(image_id)
 }

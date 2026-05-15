@@ -638,10 +638,13 @@ fn print_phase_row(label: &str, p: &PhaseStats) {
 mod tests {
     use super::*;
 
+    use crate::provider::{ImageId, ServerId};
+
     fn cmd(verb: &str, fresh: bool, p: f64, s: f64, c: f64) -> Event {
         Event::Command {
             ts: "2026-05-06T00:00:00Z".into(),
-            server_id: 1,
+            server_id: ServerId("1".into()),
+            provider: "hetzner".into(),
             project_hash: "h".into(),
             verb: verb.into(),
             success: true,
@@ -657,7 +660,8 @@ mod tests {
     fn term(secs: f64, n: u32, r: TerminationReason) -> Event {
         Event::ServerTerminated {
             ts: "2026-05-06T00:00:00Z".into(),
-            server_id: 1,
+            server_id: ServerId("1".into()),
+            provider: "hetzner".into(),
             started_at: "2026-05-06T00:00:00Z".into(),
             ended_at: "2026-05-06T00:00:00Z".into(),
             lifetime_secs: secs,
@@ -669,7 +673,8 @@ mod tests {
     fn term_at(ended_at: &str, r: TerminationReason) -> Event {
         Event::ServerTerminated {
             ts: ended_at.into(),
-            server_id: 1,
+            server_id: ServerId("1".into()),
+            provider: "hetzner".into(),
             started_at: "2026-05-06T00:00:00Z".into(),
             ended_at: ended_at.into(),
             lifetime_secs: 0.0,
@@ -681,9 +686,10 @@ mod tests {
     fn prov_at(ts: &str) -> Event {
         Event::ServerProvisioned {
             ts: ts.into(),
-            server_id: 1,
+            server_id: ServerId("1".into()),
+            provider: "hetzner".into(),
             server_type: "ccx63".into(),
-            image_id: 100,
+            image_id: ImageId("100".into()),
             region: "hel1".into(),
         }
     }
@@ -721,9 +727,10 @@ mod tests {
         let evs = vec![
             Event::ServerProvisioned {
                 ts: "2026-05-06T00:00:00Z".into(),
-                server_id: 1,
+                server_id: ServerId("1".into()),
+                provider: "hetzner".into(),
                 server_type: "ccx63".into(),
-                image_id: 100,
+                image_id: ImageId("100".into()),
                 region: "hel1".into(),
             },
             term(120.0, 3, TerminationReason::Reap),

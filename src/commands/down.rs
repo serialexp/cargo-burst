@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Args;
 
 use crate::config::{self, Config, State};
-use crate::hcloud::HCloud;
+use crate::provider::{self, VolumeId};
 
 #[derive(Args, Debug)]
 pub struct DownArgs {
@@ -29,25 +29,20 @@ pub async fn run(args: DownArgs) -> Result<()> {
     // state writes happen via update_state below so we don't race a
     // concurrent build that's mid-provision.
     let state = State::load()?;
-    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
+    let provider = provider::from_config(&cfg).await?;
 
     // ── Server ────────────────────────────────────────────────────
-    let server_deleted = if let Some(id) = state.server_id {
+    let server_deleted = if let Some(id) = state.server_id.clone() {
         println!("Deleting shared server {id}…");
-        hcloud.delete_server(id).await?;
-        // Re-read state under the lock and clear server_id. Only
-        // clear if it still points at the server we just deleted —
-        // a concurrent build may have re-provisioned in the gap, in
-        // which case we should leave the new server alone. Also
-        // close out the audit-log session under the same lock so
-        // the lifetime/command-count is recorded with reason=down.
-        config::update_state(|s| {
-            if s.server_id == Some(id) {
+        provider.delete_server(&id).await?;
+        let id_for_state = id.clone();
+        config::update_state(move |s| {
+            if s.server_id.as_ref() == Some(&id_for_state) {
                 s.server_id = None;
             }
             crate::audit::end_server_session(
                 s,
-                id,
+                &id_for_state,
                 crate::audit::TerminationReason::Down,
             );
             Ok(())
@@ -74,14 +69,10 @@ pub async fn run(args: DownArgs) -> Result<()> {
     }
 
     // Collect volume IDs to delete from the snapshot we read above.
-    // It's fine to use stale state here — even if a build provisions
-    // a new volume in parallel, our delete loop only acts on the IDs
-    // we observed, and the per-project state cleanup re-reads under
-    // the lock and only clears entries that still match.
-    let volumes: Vec<(String, i64)> = state
+    let volumes: Vec<(String, VolumeId)> = state
         .projects
         .iter()
-        .filter_map(|(hash, p)| p.volume_id.map(|id| (hash.clone(), id)))
+        .filter_map(|(hash, p)| p.volume_id.clone().map(|id| (hash.clone(), id)))
         .collect();
 
     if volumes.is_empty() {
@@ -94,46 +85,39 @@ pub async fn run(args: DownArgs) -> Result<()> {
         println!("  - volume {vol_id} (project {hash})");
     }
 
-    // Detach + delete each volume. The detach call is idempotent
-    // enough that we ignore failures and try the delete anyway —
-    // when the server got deleted just above, Hetzner auto-detaches
-    // its attached volumes, so detach here will commonly no-op.
-    // delete_volume is the operation that actually has to succeed.
-    let mut delete_failures: Vec<(i64, String)> = Vec::new();
+    let mut delete_failures: Vec<(VolumeId, String)> = Vec::new();
     for (_hash, vol_id) in &volumes {
-        if let Err(e) = hcloud.detach_volume(*vol_id).await {
+        if let Err(e) = provider.detach_volume(vol_id).await {
             tracing::debug!(
-                volume = vol_id,
+                volume = %vol_id,
                 error = %e,
                 "detach failed (likely already detached after server delete); continuing"
             );
         }
-        if let Err(e) = hcloud.delete_volume(*vol_id).await {
-            tracing::error!(volume = vol_id, error = %e, "delete failed");
-            delete_failures.push((*vol_id, e.to_string()));
+        if let Err(e) = provider.delete_volume(vol_id).await {
+            tracing::error!(volume = %vol_id, error = %e, "delete failed");
+            delete_failures.push((vol_id.clone(), e.to_string()));
         }
     }
 
-    // Single locked RMW: clear volume_id for every project whose
-    // recorded volume we just deleted, AND emit one audit
-    // termination event per success. We re-load state under the
-    // lock so a concurrent build that re-provisioned a different
-    // volume on a project doesn't get its new volume_id stomped.
-    let deleted_set: std::collections::HashSet<i64> = volumes
+    let deleted_set: std::collections::HashSet<VolumeId> = volumes
         .iter()
-        .map(|(_, id)| *id)
+        .map(|(_, id)| id.clone())
         .filter(|id| !delete_failures.iter().any(|(fid, _)| fid == id))
         .collect();
-    config::update_state(|s| {
-        for (hash, _) in &volumes {
+    let provider_name = provider.name().to_string();
+    let volumes_for_closure: Vec<(String, VolumeId)> = volumes.clone();
+    config::update_state(move |s| {
+        for (hash, _) in &volumes_for_closure {
             let Some(p) = s.projects.get_mut(hash) else { continue };
-            let Some(recorded) = p.volume_id else { continue };
+            let Some(recorded) = p.volume_id.clone() else { continue };
             if deleted_set.contains(&recorded) {
                 p.volume_id = None;
                 crate::audit::end_volume_session(
                     p,
                     hash,
-                    recorded,
+                    &recorded,
+                    &provider_name,
                     crate::audit::TerminationReason::Down,
                 );
             }

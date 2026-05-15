@@ -1,6 +1,6 @@
 [package]
 name = "cargo-burst"
-version = "0.16.2"
+version = "0.18.0"
 edition = "2024"
 authors = ["Bart Riepe <bart@serial-experiments.com>"]
 description = "Spin up a Hetzner Cloud server on demand for cargo builds; persistent per-project volume keeps target/ warm between sessions."
@@ -17,6 +17,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+async-trait = "0.1"
+# AWS SDK (Phase B Ec2Provider). Default features are TLS via rustls + tokio,
+# which already match what the rest of cargo-burst uses. The ssm crate is
+# only needed for the SSM Parameter Store lookup of Canonical's published
+# Ubuntu 24.04 AMI ID per region — avoids hardcoding a region→AMI map.
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-ssm = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-smithy-types = "1"
+base64 = "0.22"
+flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 fs2 = "0.4"

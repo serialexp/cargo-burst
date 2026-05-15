@@ -3,13 +3,35 @@
 //! Two files under `$XDG_CONFIG_HOME/cargo-burst/` (typically
 //! `~/.config/cargo-burst/`):
 //!
-//! - `config.toml` — user-edited settings (Hetzner token, defaults).
+//! - `config.toml` — user-edited settings (provider selector + per-provider
+//!   creds, defaults).
 //! - `state.json` — tool-managed runtime state (known projects → volume IDs,
 //!   currently-alive server, last image ID).
 //!
 //! Both are kept tiny and human-readable on purpose. If the tool ever gets
 //! confused about state, deleting `state.json` and rerunning is meant to be a
-//! safe recovery (volumes/servers will be re-discovered from Hetzner).
+//! safe recovery (volumes/servers will be re-discovered from the provider).
+//!
+//! ## v0.17 config shape
+//!
+//! Top-level fields are provider-agnostic; provider-specifics nest under
+//! `[hetzner]` / `[aws]`. The `provider` selector picks the active one.
+//!
+//! ```toml
+//! provider = "hetzner"     # or "aws"
+//! keep_alive_secs = 300
+//! volume_gb = 200
+//! # … other cross-provider fields …
+//!
+//! [hetzner]
+//! token = "…"
+//! regions = ["nbg1", "fsn1"]
+//! server_type = "ccx63"
+//! ```
+//!
+//! Old (≤v0.16) configs with `hetzner_token` / `region` / `server_type` at
+//! the top level are rejected with a clear error pointing at the new shape
+//! (no backwards-compat layer per Rule #8).
 
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
@@ -18,39 +40,40 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::provider::{ImageId, ServerId, VolumeId};
+
+/// Which cloud provider this config is for. Top-level selector picks
+/// the nested `[hetzner]` or `[aws]` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Hetzner,
+    Aws,
+}
+
+impl Default for ProviderKind {
+    fn default() -> Self { ProviderKind::Hetzner }
+}
+
 /// User-edited settings. Defaults are filled in for any missing field so
 /// users only have to write the parts they actually want to change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// Hetzner Cloud API token (read+write). Required.
-    pub hetzner_token: String,
-    /// Hetzner location codes (e.g. `hel1`, `nbg1`, `fsn1`, `ash`).
-    /// Accepts either a single string or a list — both are upgraded
-    /// to a list internally:
-    ///
-    ///     region = "hel1"                    # single region
-    ///     region = ["hel1", "fsn1"]          # ordered fallback list
-    ///
-    /// `regions` is an exact alias kept for users who prefer the
-    /// pluralised name; if both are set, `regions` wins. When the
-    /// first region returns Hetzner's "resource_unavailable" capacity
-    /// error, we fall through to the next, and so on.
-    ///
-    /// Volumes are regional in Hetzner — they only attach to servers
-    /// in the same location — so falling back to a different region
-    /// requires recreating the project volume there. The old volume
-    /// is deleted (it's a build cache; the loss is one fresh-build
-    /// penalty, ~30s on a CCX63), and the next session continues in
-    /// the fallback region until that one runs out too.
-    #[serde(default = "default_region", deserialize_with = "one_or_many")]
-    pub region: Vec<String>,
-    /// Plural alias for `region`. Same string-or-list semantics. If
-    /// both `region` and `regions` are set, `regions` wins.
-    #[serde(default, deserialize_with = "one_or_many")]
-    pub regions: Vec<String>,
-    /// Hetzner server type (e.g. `ccx63`, `ccx53`, `ccx43`).
-    #[serde(default = "default_server_type")]
-    pub server_type: String,
+    /// Which provider to talk to. Defaults to `hetzner` for continuity
+    /// with pre-v0.17 single-provider use.
+    #[serde(default)]
+    pub provider: ProviderKind,
+
+    /// Hetzner-specific settings, used when `provider = "hetzner"`.
+    #[serde(default)]
+    pub hetzner: Option<HetznerConfig>,
+
+    /// AWS-specific settings, used when `provider = "aws"`. Placeholder
+    /// for Phase B; deserialized so a forward-looking config doesn't
+    /// fail to parse.
+    #[serde(default)]
+    pub aws: Option<AwsConfig>,
+
     /// How long the server stays alive after the last successful build
     /// before being auto-deleted.
     #[serde(default = "default_keep_alive")]
@@ -103,6 +126,69 @@ pub struct Config {
     pub unexclude: Vec<String>,
 }
 
+/// Hetzner-specific configuration. Lives under `[hetzner]` in
+/// `config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HetznerConfig {
+    /// Hetzner Cloud API token (read+write). Required when
+    /// `provider = "hetzner"`.
+    pub token: String,
+    /// Hetzner location codes (e.g. `hel1`, `nbg1`, `fsn1`, `ash`).
+    /// Accepts either a single string or a list — both are upgraded
+    /// to a list internally:
+    ///
+    ///     region = "hel1"                    # single region
+    ///     region = ["hel1", "fsn1"]          # ordered fallback list
+    ///
+    /// `regions` is an exact alias kept for users who prefer the
+    /// pluralised name; if both are set, `regions` wins. When the
+    /// first region returns Hetzner's "resource_unavailable" capacity
+    /// error, we fall through to the next, and so on.
+    ///
+    /// Volumes are regional in Hetzner — they only attach to servers
+    /// in the same location — so falling back to a different region
+    /// requires recreating the project volume there. The old volume
+    /// is deleted (it's a build cache; the loss is one fresh-build
+    /// penalty, ~30s on a CCX63), and the next session continues in
+    /// the fallback region until that one runs out too.
+    #[serde(default = "default_hetzner_region", deserialize_with = "one_or_many")]
+    pub region: Vec<String>,
+    /// Plural alias for `region`. Same string-or-list semantics. If
+    /// both `region` and `regions` are set, `regions` wins.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub regions: Vec<String>,
+    /// Hetzner server type (e.g. `ccx63`, `ccx53`, `ccx43`).
+    #[serde(default = "default_server_type")]
+    pub server_type: String,
+}
+
+/// AWS-specific configuration. Lives under `[aws]` in `config.toml`.
+/// Placeholder shape — Phase B will populate behaviour around it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AwsConfig {
+    /// AWS region codes to try in order. Like Hetzner's `regions`,
+    /// these are tried left-to-right on capacity errors.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub regions: Vec<String>,
+    /// EC2 instance type (e.g. `c7a.48xlarge`).
+    #[serde(default)]
+    pub instance_type: String,
+    /// Use spot instances by default. Spot pricing on c7a-class
+    /// machines is ~70-80% off on-demand; the 2-minute interruption
+    /// notice is long enough that almost any cargo run completes
+    /// before it hits. Bake (one-shot, long-running, must succeed)
+    /// uses on-demand regardless.
+    #[serde(default = "default_use_spot")]
+    pub use_spot: bool,
+    /// EBS volume type for project caches. `None` → `gp3` (best
+    /// price/perf for cargo-style write-heavy bursts). Override to
+    /// `Some("io2")` etc. for very hot caches (rare).
+    #[serde(default)]
+    pub volume_type: Option<String>,
+}
+
+fn default_use_spot() -> bool { true }
+
 /// All-optional patch deserialised from
 /// `<workspace>/.config/cargo-burst.toml`. Fields that are `Some(_)`
 /// override the corresponding global config field; `forward_env` is
@@ -110,23 +196,24 @@ pub struct Config {
 /// global, deduped) so a project can add to the global allow-list
 /// without having to repeat what the user already configured globally.
 ///
-/// `hetzner_token` is intentionally accepted by the deserializer (so
-/// a typo'd token field doesn't fail parsing in some confusing way)
-/// but rejected with a clear error in [`Config::load_for_workspace`] —
-/// committing a token is a security incident waiting to happen.
+/// `[hetzner].token` / `[aws]` credentials are refused outright — tokens
+/// belong in the per-user global config, not in a file that gets
+/// committed.
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
-    /// Refused — present only so the deserializer can produce a
-    /// targeted error rather than "unknown field".
+    /// Provider override — switch between hetzner/aws on a per-project
+    /// basis. Rare, but lets a project that needs spot-instance pricing
+    /// pick AWS even when the user's global default is hetzner.
     #[serde(default)]
-    pub hetzner_token: Option<String>,
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub region: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "one_or_many_opt")]
-    pub regions: Option<Vec<String>>,
+    pub provider: Option<ProviderKind>,
+    /// Hetzner section override. Token is rejected with an error;
+    /// regions/server_type can be overridden freely.
     #[serde(default)]
-    pub server_type: Option<String>,
+    pub hetzner: Option<ProjectHetznerConfig>,
+    /// AWS section override.
+    #[serde(default)]
+    pub aws: Option<AwsConfig>,
     #[serde(default)]
     pub keep_alive_secs: Option<u64>,
     #[serde(default)]
@@ -142,22 +229,32 @@ pub struct ProjectConfig {
     /// Patterns added to the rsync exclude list on top of cargo-burst's
     /// built-in defaults. Useful for project-specific clutter that
     /// shouldn't reach the remote (large fixtures, local-only outputs).
-    /// Composed after `unexclude`, so an entry here can re-add an
-    /// extension of something `unexclude` removed (rare, but possible).
     #[serde(default)]
     pub extra_excludes: Option<Vec<String>>,
     /// Built-in default-exclude patterns to NOT apply for this project.
-    /// Pattern matching is by exact string equality against
-    /// `ssh::DEFAULT_EXCLUDES`. Most common use: `unexclude = [".git/"]`
-    /// when a binary needs the repo to be present on the remote (build
-    /// stamping, git-introspecting code, scripts that shell out to
-    /// `git`). Entries that don't match any default are warned about
-    /// once at sync time but not fatal — typos shouldn't block builds.
     #[serde(default)]
     pub unexclude: Option<Vec<String>>,
 }
 
-fn default_region() -> Vec<String> { vec!["hel1".into()] }
+/// Project-level Hetzner overrides. `token` is intentionally accepted
+/// by the deserializer (so a typo'd token field doesn't fail parsing
+/// in some confusing way) but rejected with a clear error in
+/// [`Config::load_for_workspace`] — committing a token is a security
+/// incident waiting to happen.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectHetznerConfig {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub region: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "one_or_many_opt")]
+    pub regions: Option<Vec<String>>,
+    #[serde(default)]
+    pub server_type: Option<String>,
+}
+
+fn default_hetzner_region() -> Vec<String> { vec!["hel1".into()] }
 
 /// Accept either a TOML string or a TOML array-of-strings and produce
 /// a `Vec<String>`. Lets `region = "hel1"` and `region = ["hel1", "fsn1"]`
@@ -180,9 +277,7 @@ where
 }
 
 /// `Option<Vec<String>>` variant of [`one_or_many`]: a missing field
-/// stays `None` (so we can tell "user didn't set this in the project
-/// file" apart from "user explicitly set it to []") while a present
-/// string-or-array deserialises into `Some(_)`.
+/// stays `None`.
 fn one_or_many_opt<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<String>>, D::Error>
@@ -208,7 +303,7 @@ fn default_volume_gb() -> u32 { 200 }
 fn default_volume_keep_alive() -> u64 { 3600 }
 
 /// Tool-managed runtime state. Updated on every successful operation;
-/// safe to delete to force re-discovery from Hetzner.
+/// safe to delete to force re-discovery from the provider.
 ///
 /// One server is shared across all projects — provisioning a fresh CCX-class
 /// box per project would (a) blow Bart's dedicated-core quota and (b) waste
@@ -220,22 +315,16 @@ fn default_volume_keep_alive() -> u64 { 3600 }
 pub struct State {
     /// ID of the currently-baked base image, if any.
     #[serde(default)]
-    pub image_id: Option<i64>,
+    pub image_id: Option<ImageId>,
     /// ID of the shared server, if currently alive. Cleared by the reaper
     /// when it deletes the server.
     #[serde(default)]
-    pub server_id: Option<i64>,
+    pub server_id: Option<ServerId>,
     /// Per-project state, keyed by `project::ProjectKey` (sha256-prefix of
     /// the workspace root path).
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectState>,
-    /// Session accounting for the currently-alive shared server. Set
-    /// when `ensure_shared_server` provisions a fresh box, incremented
-    /// per cargo phase, finalized into a `server_terminated` audit
-    /// event when the server is deleted. `None` between sessions.
-    /// Lives in `state.json` rather than memory because a single
-    /// session can span many cargo-burst invocations of the same
-    /// long-lived server.
+    /// Session accounting for the currently-alive shared server.
     #[serde(default)]
     pub current_server_session: Option<ServerSession>,
 }
@@ -246,21 +335,21 @@ pub struct State {
 /// run). Finalized — and zeroed — when the server is destroyed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerSession {
-    pub server_id: i64,
+    pub server_id: ServerId,
+    /// Provider that owns this session ("hetzner" / "aws"). Recorded
+    /// so cross-provider audit summaries can split costs correctly.
+    #[serde(default = "default_provider_name")]
+    pub provider: String,
     /// RFC3339 timestamp the server was provisioned at.
     pub started_at: String,
     /// Cumulative count of cargo phases that ran during this lifetime.
-    /// Bumped by `with_remote` after the closure returns (regardless
-    /// of success — a failed `cargo build` still consumed remote
-    /// resources).
     pub command_count: u32,
 }
 
+fn default_provider_name() -> String { "hetzner".into() }
+
 impl State {
-    /// Most-recent `last_used_rfc3339` across every project, parsed. Returns
-    /// `None` if no project has a parseable timestamp. Used by the *server*
-    /// reaper, which doesn't care which project ran a build — only whether
-    /// *some* project ran one inside the keep-alive window.
+    /// Most-recent `last_used_rfc3339` across every project, parsed.
     pub fn last_used_any(&self) -> Option<time::OffsetDateTime> {
         self.projects
             .values()
@@ -280,28 +369,18 @@ impl State {
 pub struct ProjectState {
     /// Human-readable workspace root path (for `status` output).
     pub workspace_path: String,
-    /// Hetzner volume ID for this project's `target/` cache, if created.
-    /// Cleared by the volume reaper when it deletes the volume.
+    /// Provider volume ID for this project's `target/` cache, if created.
     #[serde(default)]
-    pub volume_id: Option<i64>,
-    /// Last time *this* project ran a build (RFC3339). Drives both reapers:
-    /// the server reaper takes the max across all projects (it doesn't care
-    /// which project was active, only that *some* project was), while the
-    /// volume reaper compares this project's timestamp against its own
-    /// spawn time.
+    pub volume_id: Option<VolumeId>,
+    /// Last time *this* project ran a build (RFC3339).
     #[serde(default)]
     pub last_used_rfc3339: Option<String>,
     /// User-confirmed extra rsync excludes (on top of `ssh::DEFAULT_EXCLUDES`).
     /// `None` means we've never prompted the user about excludes for this
-    /// project — the next build will offer the suggested-excludes flow.
-    /// `Some(_)` (even empty) means the user has been prompted and the
-    /// flow should not re-run.
+    /// project.
     #[serde(default)]
     pub excludes: Option<Vec<String>>,
-    /// RFC3339 timestamp the current volume was provisioned at. Set
-    /// when `ensure_volume` creates a fresh volume, cleared when the
-    /// volume reaper destroys it. Used to compute volume lifetime in
-    /// the `volume_terminated` audit event.
+    /// RFC3339 timestamp the current volume was provisioned at.
     #[serde(default)]
     pub volume_started_at: Option<String>,
 }
@@ -318,13 +397,17 @@ pub fn config_dir() -> Result<PathBuf> {
 pub fn config_path() -> Result<PathBuf> { Ok(config_dir()?.join("config.toml")) }
 pub fn state_path()  -> Result<PathBuf> { Ok(config_dir()?.join("state.json")) }
 
-/// Path to the project-level config file inside a workspace, if it
-/// exists. Mirrors cargo-nextest's convention of stashing per-project
-/// tool config under `<workspace>/.config/<tool>.toml` so projects
-/// don't accumulate a flotilla of dotfiles at the root.
+/// Path to the project-level config file inside a workspace.
 pub fn project_config_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".config").join("cargo-burst.toml")
 }
+
+/// Pre-v0.17 fields that must NOT appear at the top level of the new
+/// config. If we see any of these, the user is on the old shape and
+/// needs a one-time migration. Per Rule #8 we don't ship a compat
+/// layer; the error tells them exactly what to do.
+const LEGACY_TOP_LEVEL_FIELDS: &[&str] =
+    &["hetzner_token", "region", "regions", "server_type"];
 
 impl Config {
     /// Load `config.toml`. Returns a helpful error pointing at the path if
@@ -335,32 +418,19 @@ impl Config {
 
     /// Load global config and, if `workspace_root` is `Some(_)` and a
     /// `<workspace>/.config/cargo-burst.toml` exists, layer it on top.
-    ///
-    /// Project-config rules (kept in lockstep with the docs on
-    /// [`ProjectConfig`]):
-    ///
-    /// - All non-`forward_env` fields *replace* the global value when set.
-    /// - `forward_env` is *additive* — project list appended to global,
-    ///   deduped, preserving the global ordering for entries that
-    ///   appear in both.
-    /// - `hetzner_token` is rejected outright; tokens belong in the
-    ///   per-user global config, not in a file that gets committed.
     pub fn load_for_workspace(workspace_root: Option<&Path>) -> Result<Self> {
         let path = config_path()?;
         let text = fs::read_to_string(&path).with_context(|| {
             format!(
-                "config not found at {}. Create it with at least:\n  hetzner_token = \"…\"",
+                "config not found at {}. Create it with at least:\n  \
+                 provider = \"hetzner\"\n  [hetzner]\n  token = \"…\"",
                 path.display()
             )
         })?;
+        check_for_legacy_shape(&text, &path)?;
         let mut cfg: Config = toml::from_str(&text)
             .with_context(|| format!("parsing {}", path.display()))?;
-        if cfg.hetzner_token.trim().is_empty() {
-            return Err(anyhow!(
-                "hetzner_token is empty in {}",
-                path.display()
-            ));
-        }
+        cfg.validate_credentials(&path)?;
 
         if let Some(root) = workspace_root {
             let proj_path = project_config_path(root);
@@ -368,9 +438,14 @@ impl Config {
                 Ok(proj_text) => {
                     let project: ProjectConfig = toml::from_str(&proj_text)
                         .with_context(|| format!("parsing {}", proj_path.display()))?;
-                    if project.hetzner_token.is_some() {
+                    if project
+                        .hetzner
+                        .as_ref()
+                        .and_then(|h| h.token.as_ref())
+                        .is_some()
+                    {
                         return Err(anyhow!(
-                            "{} sets `hetzner_token`, which is refused at the \
+                            "{} sets `[hetzner].token`, which is refused at the \
                              project level — tokens belong in your global \
                              {} (this file is meant to be committed; tokens are not)",
                             proj_path.display(),
@@ -393,19 +468,74 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Apply a [`ProjectConfig`] patch in place. Replace semantics for
-    /// every field except `forward_env`, which is appended-and-deduped.
-    /// Public for tests; production callers should go through
-    /// [`Config::load_for_workspace`].
+    /// Bare-bones credential check — provider-section must exist with
+    /// non-empty token.
+    fn validate_credentials(&self, path: &Path) -> Result<()> {
+        match self.provider {
+            ProviderKind::Hetzner => {
+                let h = self.hetzner.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "provider = \"hetzner\" but no [hetzner] section in {}",
+                        path.display()
+                    )
+                })?;
+                if h.token.trim().is_empty() {
+                    return Err(anyhow!(
+                        "[hetzner].token is empty in {}",
+                        path.display()
+                    ));
+                }
+            }
+            ProviderKind::Aws => {
+                // AWS credentials come from the default credential chain
+                // (env, ~/.aws/credentials, IMDS). We can't validate them
+                // here without an actual API call, so just require the
+                // section to be present.
+                if self.aws.is_none() {
+                    return Err(anyhow!(
+                        "provider = \"aws\" but no [aws] section in {}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply a [`ProjectConfig`] patch in place.
     pub fn merge_project(&mut self, project: ProjectConfig) {
-        if let Some(v) = project.region {
-            self.region = v;
+        if let Some(p) = project.provider {
+            self.provider = p;
         }
-        if let Some(v) = project.regions {
-            self.regions = v;
+        if let Some(h) = project.hetzner {
+            let target = self.hetzner.get_or_insert_with(|| HetznerConfig {
+                token: String::new(),
+                region: default_hetzner_region(),
+                regions: Vec::new(),
+                server_type: default_server_type(),
+            });
+            if let Some(v) = h.region {
+                target.region = v;
+            }
+            if let Some(v) = h.regions {
+                target.regions = v;
+            }
+            if let Some(v) = h.server_type {
+                target.server_type = v;
+            }
+            // token is rejected upstream
         }
-        if let Some(v) = project.server_type {
-            self.server_type = v;
+        if let Some(a) = project.aws {
+            let target = self.aws.get_or_insert_with(AwsConfig::default);
+            if !a.regions.is_empty() {
+                target.regions = a.regions;
+            }
+            if !a.instance_type.is_empty() {
+                target.instance_type = a.instance_type;
+            }
+            // use_spot has a default-true; an explicit project override
+            // wins.
+            target.use_spot = a.use_spot;
         }
         if let Some(v) = project.keep_alive_secs {
             self.keep_alive_secs = v;
@@ -420,20 +550,12 @@ impl Config {
             self.ssh_key_path = Some(v);
         }
         if let Some(extra) = project.forward_env {
-            // Preserve global ordering for shared entries; append
-            // project-only entries in their original order. Linear
-            // scans are fine — these lists are typically a handful
-            // of names, not thousands.
             for name in extra {
                 if !self.forward_env.iter().any(|n| n == &name) {
                     self.forward_env.push(name);
                 }
             }
         }
-        // Excludes: both fields are additive across global → project,
-        // deduped. Replace semantics would be surprising here — a
-        // project specifying `extra_excludes = ["foo"]` shouldn't
-        // silently undo a global pattern.
         if let Some(extra) = project.extra_excludes {
             for pat in extra {
                 if !self.extra_excludes.iter().any(|p| p == &pat) {
@@ -450,18 +572,44 @@ impl Config {
         }
     }
 
-    /// Ordered list of regions to try for server provisioning.
-    /// `regions` wins if set; otherwise `region`. If both are empty
-    /// (only possible when the user explicitly writes `region = []`)
-    /// we fall back to the global default so callers always get at
-    /// least one entry.
+    /// Ordered list of regions to try for server provisioning, for the
+    /// active provider.
     pub fn region_preference(&self) -> Vec<String> {
-        if !self.regions.is_empty() {
-            self.regions.clone()
-        } else if !self.region.is_empty() {
-            self.region.clone()
-        } else {
-            default_region()
+        match self.provider {
+            ProviderKind::Hetzner => {
+                let Some(h) = self.hetzner.as_ref() else {
+                    return default_hetzner_region();
+                };
+                if !h.regions.is_empty() {
+                    h.regions.clone()
+                } else if !h.region.is_empty() {
+                    h.region.clone()
+                } else {
+                    default_hetzner_region()
+                }
+            }
+            ProviderKind::Aws => {
+                self.aws
+                    .as_ref()
+                    .map(|a| a.regions.clone())
+                    .unwrap_or_default()
+            }
+        }
+    }
+
+    /// Server type / instance type for the active provider.
+    pub fn server_type(&self) -> String {
+        match self.provider {
+            ProviderKind::Hetzner => self
+                .hetzner
+                .as_ref()
+                .map(|h| h.server_type.clone())
+                .unwrap_or_else(default_server_type),
+            ProviderKind::Aws => self
+                .aws
+                .as_ref()
+                .map(|a| a.instance_type.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -473,6 +621,42 @@ impl Config {
         }
         Ok(config_dir()?.join("ssh_key"))
     }
+}
+
+/// Reject pre-v0.17 configs that still have top-level `hetzner_token`,
+/// `region`, `regions`, or `server_type` fields. Pinpoint scan rather
+/// than a deserialize attempt — we want to tell the user *exactly*
+/// what to move.
+fn check_for_legacy_shape(text: &str, path: &Path) -> Result<()> {
+    // A "top-level" field is any line that starts (ignoring leading
+    // whitespace) with the field name followed by `=`, before any
+    // `[section]` header appears. We do a one-pass scan.
+    let mut found: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        if let Some(eq) = trimmed.find('=') {
+            let name = trimmed[..eq].trim();
+            for f in LEGACY_TOP_LEVEL_FIELDS {
+                if name == *f {
+                    found.push(*f);
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{}: pre-v0.17 fields at top level ({}). cargo-burst v0.17 moved \
+         Hetzner-specific settings into a `[hetzner]` section. Update to:\n\n  \
+         provider = \"hetzner\"\n  [hetzner]\n  token = \"…\"\n  regions = [\"…\"]\n  \
+         server_type = \"ccx63\"\n",
+        path.display(),
+        found.join(", "),
+    ))
 }
 
 impl State {
@@ -489,8 +673,7 @@ impl State {
         }
     }
 
-    /// Atomic-ish save: write to `state.json.tmp` then rename. Avoids
-    /// half-written state if the tool is killed mid-write.
+    /// Atomic-ish save: write to `state.json.tmp` then rename.
     pub fn save(&self) -> Result<()> {
         let path = state_path()?;
         let tmp = path.with_extension("json.tmp");
@@ -502,33 +685,12 @@ impl State {
 }
 
 /// Cooperative cross-process exclusive lock guarding mutations to
-/// `state.json`. cargo-burst processes can run concurrently (different
-/// projects' builds against the same shared server), and they all touch
-/// the same state file. The lock serialises:
-///
-/// - Server provisioning (so two concurrent first-time builds don't each
-///   create their own CCX63 — see `ensure_shared_server`).
-/// - Volume create/attach.
-/// - Read-modify-write of `state.json`. Without the lock, two processes
-///   loading state, mutating different fields, and saving back would lose
-///   one set of changes.
-///
-/// Implemented via `flock(LOCK_EX)` on `<config_dir>/state.lock`. POSIX
-/// closes the fd (and releases the lock) automatically on process death,
-/// so a crashed `cargo burst` never leaves a stuck lock — no PID-file
-/// liveness check needed.
+/// `state.json`.
 pub struct StateLock {
-    /// Held only to keep the fd open. Drop releases the flock.
     _file: fs::File,
 }
 
 impl StateLock {
-    /// Acquire the lock, blocking until it's available. Logs a one-time
-    /// "waiting" message so the user knows why their command is paused.
-    ///
-    /// Polled rather than blocking-syscalled so we can stay async-friendly:
-    /// `flock`'s blocking variant would tie up the tokio runtime thread
-    /// indefinitely. The poll loop sleeps 500ms between attempts.
     pub async fn acquire() -> Result<Self> {
         use fs2::FileExt;
         let path = config_dir()?.join("state.lock");
@@ -562,16 +724,10 @@ impl StateLock {
 }
 
 impl Drop for StateLock {
-    fn drop(&mut self) {
-        // Drop closes the file, which releases the flock. Explicit unlock
-        // here would be redundant.
-    }
+    fn drop(&mut self) {}
 }
 
-/// Read-modify-write `state.json` under the global lock. Use this for any
-/// state mutation outside the long-held provisioning lock — every save
-/// re-reads the file first, so concurrent processes can't clobber each
-/// other's changes.
+/// Read-modify-write `state.json` under the global lock.
 pub async fn update_state<F>(f: F) -> Result<()>
 where
     F: FnOnce(&mut State) -> Result<()>,
@@ -591,53 +747,73 @@ mod tests {
         toml::from_str(toml).expect("parse config")
     }
 
+    fn parse_with_validate(toml: &str) -> Result<Config> {
+        check_for_legacy_shape(toml, Path::new("test.toml"))?;
+        let cfg: Config =
+            toml::from_str(toml).with_context(|| "parsing test toml")?;
+        cfg.validate_credentials(Path::new("test.toml"))?;
+        Ok(cfg)
+    }
+
+    /// Note: this prefix ends BEFORE the `[hetzner]` section so test
+    /// callers can prepend top-level fields. To append fields inside
+    /// `[hetzner]`, use [`MINIMAL_HETZNER_WITH_SECTION`].
+    const MINIMAL_HETZNER_PRE_SECTION: &str = "provider = \"hetzner\"\n";
+    const MINIMAL_HETZNER: &str = r#"
+provider = "hetzner"
+[hetzner]
+token = "x"
+"#;
+
     #[test]
     fn region_accepts_single_string() {
-        let cfg = parse(r#"hetzner_token = "x"
-region = "hel1""#);
-        assert_eq!(cfg.region, vec!["hel1".to_string()]);
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}region = \"hel1\"\n"
+        ));
+        let h = cfg.hetzner.as_ref().unwrap();
+        assert_eq!(h.region, vec!["hel1".to_string()]);
         assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
     }
 
     #[test]
     fn region_accepts_array() {
-        let cfg = parse(r#"hetzner_token = "x"
-region = ["hel1", "fsn1", "nbg1"]"#);
-        assert_eq!(cfg.region, vec!["hel1", "fsn1", "nbg1"]);
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}region = [\"hel1\", \"fsn1\", \"nbg1\"]\n"
+        ));
+        let h = cfg.hetzner.as_ref().unwrap();
+        assert_eq!(h.region, vec!["hel1", "fsn1", "nbg1"]);
         assert_eq!(cfg.region_preference(), vec!["hel1", "fsn1", "nbg1"]);
     }
 
     #[test]
     fn regions_alias_accepts_single_string() {
-        let cfg = parse(r#"hetzner_token = "x"
-regions = "fsn1""#);
-        assert_eq!(cfg.regions, vec!["fsn1".to_string()]);
-        // Plural wins when present, even as a single string.
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}regions = \"fsn1\"\n"
+        ));
+        let h = cfg.hetzner.as_ref().unwrap();
+        assert_eq!(h.regions, vec!["fsn1".to_string()]);
         assert_eq!(cfg.region_preference(), vec!["fsn1".to_string()]);
     }
 
     #[test]
     fn regions_alias_accepts_array() {
-        let cfg = parse(r#"hetzner_token = "x"
-regions = ["hel1", "fsn1"]"#);
-        assert_eq!(cfg.regions, vec!["hel1", "fsn1"]);
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}regions = [\"hel1\", \"fsn1\"]\n"
+        ));
         assert_eq!(cfg.region_preference(), vec!["hel1", "fsn1"]);
     }
 
     #[test]
     fn plural_regions_wins_when_both_set() {
-        let cfg = parse(r#"hetzner_token = "x"
-region = "hel1"
-regions = ["fsn1", "nbg1"]"#);
-        // Both fields keep their parsed values; preference picks regions.
-        assert_eq!(cfg.region, vec!["hel1".to_string()]);
-        assert_eq!(cfg.regions, vec!["fsn1", "nbg1"]);
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}region = \"hel1\"\nregions = [\"fsn1\", \"nbg1\"]\n"
+        ));
         assert_eq!(cfg.region_preference(), vec!["fsn1", "nbg1"]);
     }
 
     #[test]
     fn region_defaults_when_neither_field_set() {
-        let cfg = parse(r#"hetzner_token = "x""#);
+        let cfg = parse(MINIMAL_HETZNER);
         assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
     }
 
@@ -647,40 +823,40 @@ regions = ["fsn1", "nbg1"]"#);
 
     #[test]
     fn project_replaces_simple_fields() {
-        let mut cfg = parse(r#"hetzner_token = "x""#);
+        let mut cfg = parse(MINIMAL_HETZNER);
         let proj = parse_project(r#"
-server_type = "ccx53"
 volume_gb = 50
 keep_alive_secs = 60
+[hetzner]
+server_type = "ccx53"
 "#);
         cfg.merge_project(proj);
-        assert_eq!(cfg.server_type, "ccx53");
+        assert_eq!(cfg.server_type(), "ccx53");
         assert_eq!(cfg.volume_gb, 50);
         assert_eq!(cfg.keep_alive_secs, 60);
-        // Untouched defaults survive.
         assert_eq!(cfg.volume_keep_alive_secs, default_volume_keep_alive());
     }
 
     #[test]
     fn project_replaces_regions_not_merges() {
-        let mut cfg = parse(r#"hetzner_token = "x"
-region = ["hel1", "fsn1"]"#);
-        let proj = parse_project(r#"region = "nbg1""#);
+        let mut cfg = parse(&format!(
+            "{MINIMAL_HETZNER}region = [\"hel1\", \"fsn1\"]\n"
+        ));
+        let proj = parse_project(r#"[hetzner]
+region = "nbg1""#);
         cfg.merge_project(proj);
-        // Replace, not extend — a project saying "I want nbg1" doesn't
-        // mean "and also keep all the global fallbacks I never asked
-        // for". The whole list is the project's intent.
-        assert_eq!(cfg.region, vec!["nbg1".to_string()]);
+        let h = cfg.hetzner.as_ref().unwrap();
+        assert_eq!(h.region, vec!["nbg1".to_string()]);
     }
 
     #[test]
     fn project_forward_env_is_additive_and_deduped() {
-        let mut cfg = parse(r#"hetzner_token = "x"
-forward_env = ["RUST_LOG", "RUST_BACKTRACE"]"#);
+        // Top-level fields go BEFORE the [hetzner] section in TOML.
+        let mut cfg = parse(&format!(
+            "{MINIMAL_HETZNER_PRE_SECTION}forward_env = [\"RUST_LOG\", \"RUST_BACKTRACE\"]\n[hetzner]\ntoken = \"x\"\n"
+        ));
         let proj = parse_project(r#"forward_env = ["DATABASE_URL", "RUST_LOG"]"#);
         cfg.merge_project(proj);
-        // Global ordering preserved; project-only entries appended;
-        // RUST_LOG appears once even though it's in both lists.
         assert_eq!(
             cfg.forward_env,
             vec!["RUST_LOG", "RUST_BACKTRACE", "DATABASE_URL"]
@@ -689,8 +865,9 @@ forward_env = ["RUST_LOG", "RUST_BACKTRACE"]"#);
 
     #[test]
     fn project_extra_excludes_are_additive_and_deduped() {
-        let mut cfg = parse(r#"hetzner_token = "x"
-extra_excludes = ["fixtures/large/"]"#);
+        let mut cfg = parse(&format!(
+            "{MINIMAL_HETZNER_PRE_SECTION}extra_excludes = [\"fixtures/large/\"]\n[hetzner]\ntoken = \"x\"\n"
+        ));
         let proj = parse_project(r#"extra_excludes = ["fixtures/large/", "*.bak"]"#);
         cfg.merge_project(proj);
         assert_eq!(cfg.extra_excludes, vec!["fixtures/large/", "*.bak"]);
@@ -698,8 +875,9 @@ extra_excludes = ["fixtures/large/"]"#);
 
     #[test]
     fn project_unexclude_is_additive_and_deduped() {
-        let mut cfg = parse(r#"hetzner_token = "x"
-unexclude = [".git/"]"#);
+        let mut cfg = parse(&format!(
+            "{MINIMAL_HETZNER_PRE_SECTION}unexclude = [\".git/\"]\n[hetzner]\ntoken = \"x\"\n"
+        ));
         let proj = parse_project(r#"unexclude = [".git/", ".vscode/"]"#);
         cfg.merge_project(proj);
         assert_eq!(cfg.unexclude, vec![".git/", ".vscode/"]);
@@ -707,49 +885,91 @@ unexclude = [".git/"]"#);
 
     #[test]
     fn project_unexclude_only_set_at_project_level_works() {
-        // No global unexclude, project adds one.
-        let mut cfg = parse(r#"hetzner_token = "x""#);
+        let mut cfg = parse(MINIMAL_HETZNER);
         cfg.merge_project(parse_project(r#"unexclude = [".git/"]"#));
         assert_eq!(cfg.unexclude, vec![".git/"]);
     }
 
     #[test]
     fn project_unset_fields_dont_clobber_global() {
-        let mut cfg = parse(r#"hetzner_token = "x"
+        let mut cfg = parse(r#"
+provider = "hetzner"
+volume_gb = 200
+[hetzner]
+token = "x"
 server_type = "ccx63"
-volume_gb = 200"#);
-        // Empty project file — should be a no-op.
+"#);
         cfg.merge_project(parse_project(""));
-        assert_eq!(cfg.server_type, "ccx63");
+        assert_eq!(cfg.server_type(), "ccx63");
         assert_eq!(cfg.volume_gb, 200);
     }
 
     #[test]
     fn project_token_is_caught_at_deserialize() {
-        // The deserializer accepts `hetzner_token` so we can produce a
-        // targeted error in load_for_workspace; the parsed struct
-        // surfaces it as Some(_).
-        let proj = parse_project(r#"hetzner_token = "leaked""#);
-        assert_eq!(proj.hetzner_token.as_deref(), Some("leaked"));
+        let proj = parse_project(r#"[hetzner]
+token = "leaked""#);
+        assert_eq!(
+            proj.hetzner.as_ref().unwrap().token.as_deref(),
+            Some("leaked")
+        );
     }
 
     #[test]
     fn project_unknown_field_fails_to_parse() {
-        // deny_unknown_fields keeps typos honest.
-        let result: Result<ProjectConfig, _> =
+        let result: std::result::Result<ProjectConfig, _> =
             toml::from_str(r#"servr_type = "ccx53""#);
         assert!(result.is_err(), "expected typo to fail");
     }
 
     #[test]
     fn explicit_empty_array_falls_back_to_default() {
-        // `region = []` would otherwise produce an empty preference
-        // list, which every caller would have to defend against.
-        // region_preference returns the global default in that case.
-        let cfg = parse(r#"hetzner_token = "x"
-region = []"#);
-        assert!(cfg.region.is_empty());
-        assert!(cfg.regions.is_empty());
+        let cfg = parse(&format!(
+            "{MINIMAL_HETZNER}region = []\n"
+        ));
         assert_eq!(cfg.region_preference(), vec!["hel1".to_string()]);
+    }
+
+    #[test]
+    fn legacy_top_level_fields_are_rejected() {
+        let bad = r#"
+hetzner_token = "x"
+region = "hel1"
+"#;
+        let err = parse_with_validate(bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("pre-v0.17"),
+            "expected migration hint, got: {msg}"
+        );
+        assert!(msg.contains("hetzner_token"));
+    }
+
+    #[test]
+    fn missing_provider_section_rejected() {
+        let bad = r#"provider = "hetzner""#;
+        let err = parse_with_validate(bad).unwrap_err();
+        assert!(format!("{err}").contains("[hetzner]"));
+    }
+
+    #[test]
+    fn aws_provider_requires_section() {
+        let bad = r#"provider = "aws""#;
+        let err = parse_with_validate(bad).unwrap_err();
+        assert!(format!("{err}").contains("[aws]"));
+    }
+
+    #[test]
+    fn aws_minimal_parses() {
+        let ok = r#"
+provider = "aws"
+[aws]
+regions = ["us-east-1"]
+instance_type = "c7a.48xlarge"
+"#;
+        let cfg = parse_with_validate(ok).unwrap();
+        assert_eq!(cfg.provider, ProviderKind::Aws);
+        assert_eq!(cfg.region_preference(), vec!["us-east-1".to_string()]);
+        assert_eq!(cfg.server_type(), "c7a.48xlarge");
+        assert!(cfg.aws.unwrap().use_spot);
     }
 }

@@ -15,6 +15,7 @@ mod hcloud;
 mod hints;
 mod pipe_guard;
 mod project;
+mod provider;
 mod ssh;
 
 /// Top-level CLI. We support invocation both as a standalone binary

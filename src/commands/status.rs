@@ -12,8 +12,8 @@
 use anyhow::Result;
 
 use crate::config::{Config, State};
-use crate::hcloud::HCloud;
 use crate::project::ProjectKey;
+use crate::provider;
 use crate::ssh;
 
 /// Connection-string text we print alongside each DB's up/down state.
@@ -39,7 +39,7 @@ pub async fn run() -> Result<()> {
         .map(|p| p.workspace_root);
     let cfg = Config::load_for_workspace(workspace_root.as_deref())?;
     let state = State::load()?;
-    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
+    let provider = provider::from_config(&cfg).await?;
 
     if let Some(root) = workspace_root.as_deref() {
         let proj = crate::config::project_config_path(root);
@@ -47,21 +47,27 @@ pub async fn run() -> Result<()> {
             println!("project cfg:  {} (applied)", proj.display());
         }
     }
+    println!("provider:     {}", provider.name());
+    let billing_min_secs = provider.billing_minimum().as_secs();
+    if billing_min_secs > 0 {
+        println!("billing min:  {}s per server lifetime", billing_min_secs);
+    }
     println!("regions:      {}", cfg.region_preference().join(", "));
-    println!("server type:  {}", cfg.server_type);
+    println!("server type:  {}", cfg.server_type());
     if !cfg.forward_env.is_empty() {
         println!("forward_env:  {}", cfg.forward_env.join(", "));
     }
     println!();
 
-    match state.image_id {
-        Some(id) => match hcloud.get_image(id).await {
-            Ok(img) => println!(
+    match state.image_id.as_ref() {
+        Some(id) => match provider.get_image(id).await {
+            Ok(Some(img)) => println!(
                 "image:        {} ({})  desc={}",
                 id,
-                img.status,
+                img.status.as_str(),
                 img.description.as_deref().unwrap_or("-")
             ),
+            Ok(None) => println!("image:        {id} (deleted upstream)"),
             Err(e) => println!("image:        {id} (lookup failed: {e})"),
         },
         None => println!("image:        none — run `cargo burst image build`"),
@@ -70,21 +76,22 @@ pub async fn run() -> Result<()> {
 
     // Shared server (one across all projects).
     let mut server_ip: Option<String> = None;
-    match state.server_id {
-        Some(id) => match hcloud.get_server(id).await {
-            Ok(s) => {
-                let ip = s.public_net.ipv4.as_ref().map(|i| i.ip.clone());
+    match state.server_id.as_ref() {
+        Some(id) => match provider.get_server(id).await {
+            Ok(Some(s)) => {
+                let ip = s.public_ip.clone();
                 println!(
                     "server:       {id}  type={}  status={}  ip={}",
-                    s.server_type.name,
-                    s.status,
+                    s.server_type,
+                    s.status.as_str(),
                     ip.as_deref().unwrap_or("-")
                 );
-                if s.status == "running" {
+                if matches!(s.status, crate::provider::ServerStatus::Running) {
                     server_ip = ip;
                 }
             }
-            Err(_) => println!("server:       {id} (deleted upstream)"),
+            Ok(None) => println!("server:       {id} (deleted upstream)"),
+            Err(e) => println!("server:       {id} (lookup failed: {e})"),
         },
         None => println!("server:       - (none provisioned)"),
     }
@@ -151,12 +158,15 @@ pub async fn run() -> Result<()> {
     println!("Projects:");
     for (hash, p) in &state.projects {
         println!("  {hash}  {}", p.workspace_path);
-        match p.volume_id {
-            Some(id) => match hcloud.get_volume(id).await {
-                Ok(v) => println!(
+        match p.volume_id.as_ref() {
+            Some(id) => match provider.get_volume(id).await {
+                Ok(Some(v)) => println!(
                     "    volume:  {id}  size={}GB  status={}  attached_to={:?}",
-                    v.size, v.status, v.server
+                    v.size_gb,
+                    v.status.as_str(),
+                    v.attached_to.as_ref().map(|s| s.to_string())
                 ),
+                Ok(None) => println!("    volume:  {id}  (deleted upstream)"),
                 Err(e) => println!("    volume:  {id}  (lookup failed: {e})"),
             },
             None => println!("    volume:  -  (reaped or not yet created)"),

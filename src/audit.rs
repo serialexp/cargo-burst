@@ -31,6 +31,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::config;
+use crate::provider::{ImageId, ServerId, VolumeId};
 
 /// Reason a resource was destroyed. Surfaced in the
 /// `server_terminated` / `volume_terminated` events so post-hoc
@@ -63,14 +64,18 @@ pub enum TerminationReason {
 pub enum Event {
     ServerProvisioned {
         ts: String,
-        server_id: i64,
+        server_id: ServerId,
+        #[serde(default = "default_provider_tag")]
+        provider: String,
         server_type: String,
-        image_id: i64,
+        image_id: ImageId,
         region: String,
     },
     ServerTerminated {
         ts: String,
-        server_id: i64,
+        server_id: ServerId,
+        #[serde(default = "default_provider_tag")]
+        provider: String,
         started_at: String,
         ended_at: String,
         lifetime_secs: f64,
@@ -81,7 +86,9 @@ pub enum Event {
         ts: String,
         project_hash: String,
         project_root: String,
-        volume_id: i64,
+        volume_id: VolumeId,
+        #[serde(default = "default_provider_tag")]
+        provider: String,
         size_gb: u32,
         region: String,
     },
@@ -89,7 +96,9 @@ pub enum Event {
         ts: String,
         project_hash: String,
         project_root: String,
-        volume_id: i64,
+        volume_id: VolumeId,
+        #[serde(default = "default_provider_tag")]
+        provider: String,
         started_at: String,
         ended_at: String,
         lifetime_secs: f64,
@@ -97,7 +106,9 @@ pub enum Event {
     },
     Command {
         ts: String,
-        server_id: i64,
+        server_id: ServerId,
+        #[serde(default = "default_provider_tag")]
+        provider: String,
         project_hash: String,
         /// One of `build`, `test`, `check`, `clippy`, `bench`. We
         /// derive this from the per-subcommand label rather than
@@ -151,7 +162,8 @@ pub enum Event {
 /// the `record_command` call site reads cleanly and we can grow the
 /// shape later without renumbering positional args.
 pub struct CommandSample<'a> {
-    pub server_id: i64,
+    pub server_id: ServerId,
+    pub provider: &'a str,
     pub project_hash: &'a str,
     pub verb: &'a str,
     pub success: bool,
@@ -161,6 +173,8 @@ pub struct CommandSample<'a> {
     pub fresh_server: bool,
     pub fresh_volume: bool,
 }
+
+fn default_provider_tag() -> String { "hetzner".into() }
 
 /// Path to the JSONL audit log. Lives next to `state.json` and
 /// `config.toml`. Created on first append.
@@ -240,9 +254,10 @@ pub fn elapsed_secs(started_at: &str, ended_at: &str) -> f64 {
 /// accounting still balances.
 pub fn begin_server_session(
     state: &mut config::State,
-    server_id: i64,
+    server_id: ServerId,
+    provider: &str,
     server_type: &str,
-    image_id: i64,
+    image_id: ImageId,
     region: &str,
 ) {
     if let Some(prev) = state.current_server_session.take() {
@@ -256,13 +271,15 @@ pub fn begin_server_session(
     let now = now_rfc3339();
     append_or_warn(&Event::ServerProvisioned {
         ts: now.clone(),
-        server_id,
+        server_id: server_id.clone(),
+        provider: provider.to_string(),
         server_type: server_type.to_string(),
         image_id,
         region: region.to_string(),
     });
     state.current_server_session = Some(config::ServerSession {
         server_id,
+        provider: provider.to_string(),
         started_at: now,
         command_count: 0,
     });
@@ -275,16 +292,16 @@ pub fn begin_server_session(
 /// warning rather than corrupting state).
 pub fn end_server_session(
     state: &mut config::State,
-    server_id: i64,
+    server_id: &ServerId,
     reason: TerminationReason,
 ) {
     let Some(session) = state.current_server_session.take() else {
         return;
     };
-    if session.server_id != server_id {
+    if &session.server_id != server_id {
         tracing::warn!(
-            recorded = session.server_id,
-            terminating = server_id,
+            recorded = %session.server_id,
+            terminating = %server_id,
             "current_server_session does not match the server being terminated; \
              leaving session intact"
         );
@@ -303,7 +320,8 @@ pub fn record_command(state: &mut config::State, sample: &CommandSample<'_>) {
     let elapsed_secs = sample.provision_secs + sample.sync_secs + sample.cargo_secs;
     append_or_warn(&Event::Command {
         ts: now_rfc3339(),
-        server_id: sample.server_id,
+        server_id: sample.server_id.clone(),
+        provider: sample.provider.to_string(),
         project_hash: sample.project_hash.to_string(),
         verb: sample.verb.to_string(),
         success: sample.success,
@@ -328,20 +346,17 @@ pub fn record_command(state: &mut config::State, sample: &CommandSample<'_>) {
 pub fn begin_volume_session(
     p: &mut config::ProjectState,
     project_hash: &str,
-    volume_id: i64,
+    volume_id: VolumeId,
+    provider: &str,
     size_gb: u32,
     region: &str,
 ) {
     if let Some(prev_started) = p.volume_started_at.take() {
-        // We don't know the previous volume_id (it's already gone
-        // from state by the time `ensure_volume` is creating a new
-        // one). Emit an orphaned termination keyed by the new
-        // volume_id and the recorded started_at — imperfect but
-        // honest about the gap.
         emit_volume_terminated(
             project_hash,
             &p.workspace_path,
-            volume_id,
+            &volume_id,
+            provider,
             &prev_started,
             TerminationReason::Orphaned,
         );
@@ -352,6 +367,7 @@ pub fn begin_volume_session(
         project_hash: project_hash.to_string(),
         project_root: p.workspace_path.clone(),
         volume_id,
+        provider: provider.to_string(),
         size_gb,
         region: region.to_string(),
     });
@@ -364,20 +380,29 @@ pub fn begin_volume_session(
 pub fn end_volume_session(
     p: &mut config::ProjectState,
     project_hash: &str,
-    volume_id: i64,
+    volume_id: &VolumeId,
+    provider: &str,
     reason: TerminationReason,
 ) {
     let Some(started_at) = p.volume_started_at.take() else {
         return;
     };
-    emit_volume_terminated(project_hash, &p.workspace_path, volume_id, &started_at, reason);
+    emit_volume_terminated(
+        project_hash,
+        &p.workspace_path,
+        volume_id,
+        provider,
+        &started_at,
+        reason,
+    );
 }
 
 fn emit_server_terminated(session: &config::ServerSession, reason: TerminationReason) {
     let ended = now_rfc3339();
     append_or_warn(&Event::ServerTerminated {
         ts: ended.clone(),
-        server_id: session.server_id,
+        server_id: session.server_id.clone(),
+        provider: session.provider.clone(),
         started_at: session.started_at.clone(),
         ended_at: ended.clone(),
         lifetime_secs: elapsed_secs(&session.started_at, &ended),
@@ -389,7 +414,8 @@ fn emit_server_terminated(session: &config::ServerSession, reason: TerminationRe
 fn emit_volume_terminated(
     project_hash: &str,
     project_root: &str,
-    volume_id: i64,
+    volume_id: &VolumeId,
+    provider: &str,
     started_at: &str,
     reason: TerminationReason,
 ) {
@@ -398,7 +424,8 @@ fn emit_volume_terminated(
         ts: ended.clone(),
         project_hash: project_hash.to_string(),
         project_root: project_root.to_string(),
-        volume_id,
+        volume_id: volume_id.clone(),
+        provider: provider.to_string(),
         started_at: started_at.to_string(),
         ended_at: ended.clone(),
         lifetime_secs: elapsed_secs(started_at, &ended),
@@ -414,16 +441,19 @@ mod tests {
     fn server_provisioned_round_trips() {
         let e = Event::ServerProvisioned {
             ts: "2026-05-05T13:00:00Z".into(),
-            server_id: 42,
+            server_id: ServerId("42".into()),
+            provider: "hetzner".into(),
             server_type: "ccx63".into(),
-            image_id: 100,
+            image_id: ImageId("100".into()),
             region: "hel1".into(),
         };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains(r#""event":"server_provisioned""#));
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
-            Event::ServerProvisioned { server_id, .. } => assert_eq!(server_id, 42),
+            Event::ServerProvisioned { server_id, .. } => {
+                assert_eq!(server_id.as_str(), "42");
+            }
             _ => panic!("wrong variant"),
         }
     }

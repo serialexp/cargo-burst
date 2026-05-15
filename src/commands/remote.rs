@@ -16,17 +16,18 @@
 //! exactly the closure each subcommand passes into `with_remote`.
 
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::commands::reap;
 use crate::config::{self, Config, ProjectState, State, StateLock};
-use crate::hcloud::{
-    CreateServerRequest, CreateVolumeRequest, HCloud, ImageRef, Server, Volume,
-};
 use crate::project::{ProjectKey, SHARED_SERVER_NAME};
+use crate::provider::{
+    self, Provider, ProvisionError, ServerInfo, ServerSpec, SshKeyId, VolumeInfo,
+    VolumeSpec,
+};
 use crate::ssh;
 
 /// How often the heartbeat task bumps `last_used_rfc3339` while a build
@@ -35,8 +36,6 @@ use crate::ssh;
 /// bows out instead of deleting the server out from under us.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Hetzner server-create polling for "running" status.
-const SERVER_BOOT_TIMEOUT: Duration = Duration::from_secs(180);
 /// SSH come-up window after the server reports "running".
 const SSH_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -132,7 +131,7 @@ where
     // client (whose token comes from config) and the env-resolution
     // step below (which reads `cfg.forward_env`).
     let cfg = Config::load_for_workspace(Some(&project.workspace_root))?;
-    let hcloud = HCloud::new(cfg.hetzner_token.clone())?;
+    let provider = provider::from_config(&cfg).await?;
 
     // Resolve the merged environment now so it's a flat
     // `Vec<(name, value)>` by the time `build_remote_cmd` consumes
@@ -155,7 +154,7 @@ where
     // stale in-memory state.
     let ssh_key_path = cfg.ssh_key_path()?;
     let pubkey = ssh::ensure_ssh_key(&ssh_key_path).await?;
-    let (server, fresh_server, volume, fresh_volume, extra_excludes) = {
+    let (server, fresh_server, volume, device, fresh_volume, extra_excludes) = {
         let _lock = StateLock::acquire().await?;
         let mut state = State::load()?;
 
@@ -172,9 +171,10 @@ where
 
         let image_id = state
             .image_id
+            .clone()
             .ok_or_else(|| anyhow!("no baked image yet — run `cargo burst image build` first"))?;
 
-        let hetzner_key = hcloud.ensure_ssh_key("cargo-burst", &pubkey).await?;
+        let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
 
         // Local size summary + (on first run) confirm excludes. Doing
         // it before provisioning means the user sees what's about to
@@ -196,21 +196,21 @@ where
         //      and recreate (build cache rebuilds in ~30s, the alternative
         //      is failing the build entirely).
         let existing_volume_region =
-            peek_volume_region(&hcloud, &project, &state).await;
+            peek_volume_region(provider.as_ref(), &project, &state).await;
         let attempt_regions =
             compute_attempt_regions(&cfg, existing_volume_region.as_deref());
         let (server, fresh_server, server_region) = ensure_shared_server(
-            &hcloud,
+            provider.as_ref(),
             &cfg,
-            image_id,
-            hetzner_key.id,
+            &image_id,
+            &ssh_key_id,
             &mut state,
             &attempt_regions,
         )
         .await?;
         let (volume, fresh_volume) =
-            ensure_volume(&hcloud, &cfg, &project, &mut state, &server_region).await?;
-        let volume = ensure_volume_attached(&hcloud, volume, server.id).await?;
+            ensure_volume(provider.as_ref(), &cfg, &project, &mut state, &server_region).await?;
+        let device = ensure_volume_attached(provider.as_ref(), &volume, &server.id).await?;
 
         // Bump this project's last_used immediately — see reap.rs's
         // "(2) Activity-since-spawn" logic. Without this, a previous
@@ -220,15 +220,13 @@ where
             p.last_used_rfc3339 = Some(now_rfc3339());
         }
         state.save()?;
-        (server, fresh_server, volume, fresh_volume, extra_excludes)
+        (server, fresh_server, volume, device, fresh_volume, extra_excludes)
         // _lock drops here; concurrent runs can now provision.
     };
 
     let server_ip = server
-        .public_net
-        .ipv4
-        .as_ref()
-        .map(|i| i.ip.clone())
+        .public_ip
+        .clone()
         .ok_or_else(|| anyhow!("server has no IPv4"))?;
 
     // SSH wait first; everything below talks to the host.
@@ -248,7 +246,7 @@ where
     // state. The standalone mkdir we used to do is folded into rsync
     // via --rsync-path. One less SSH round-trip per run.
     let remote_src = format!("/home/work/src/{}/", project.hash);
-    let mount_script = render_mount_script(volume.id, &project.hash);
+    let mount_script = render_mount_script(&device.device_path, &project.hash);
     // Compose the full exclude list for rsync — defaults filtered by
     // `unexclude`, plus `cfg.extra_excludes`, plus state-saved
     // interactive extras. Same composition the size scanner used,
@@ -258,7 +256,7 @@ where
     let exclude_args: Vec<&str> = merged_excludes.iter().map(String::as_str).collect();
     let sync_start = Instant::now();
     tracing::info!(
-        volume = volume.id,
+        volume = %volume.id,
         hash = %project.hash,
         "ensuring volume mounted + rsyncing source (in parallel)"
     );
@@ -318,7 +316,8 @@ where
     // "Clippy", "Bench") so we just lowercase + collapse "tests" →
     // "test" to match cargo's own verb spelling.
     let hash_for_final = project.hash.clone();
-    let server_id_for_audit = server.id;
+    let server_id_for_audit = server.id.clone();
+    let provider_name = provider.name().to_string();
     let verb = label_to_verb(label);
     let success = cargo_result.is_ok();
     let provision_secs = provision_elapsed.as_secs_f64();
@@ -332,6 +331,7 @@ where
             s,
             &crate::audit::CommandSample {
                 server_id: server_id_for_audit,
+                provider: &provider_name,
                 project_hash: &hash_for_final,
                 verb: &verb,
                 success,
@@ -352,10 +352,12 @@ where
     if !opts.no_reap {
         let keep_alive = opts.keep_alive.unwrap_or(cfg.keep_alive_secs);
         let volume_keep_alive = cfg.volume_keep_alive_secs;
-        if let Err(e) = reap::spawn_server(server.id, keep_alive) {
+        if let Err(e) = reap::spawn_server(server.id.clone(), keep_alive) {
             tracing::warn!("failed to spawn server reaper: {e}");
         }
-        if let Err(e) = reap::spawn_volume(volume.id, project.hash.clone(), volume_keep_alive) {
+        if let Err(e) =
+            reap::spawn_volume(volume.id.clone(), project.hash.clone(), volume_keep_alive)
+        {
             tracing::warn!("failed to spawn volume reaper: {e}");
         }
         let outcome = if cargo_result.is_ok() { "✓" } else { "✗" };
@@ -432,38 +434,26 @@ fn spawn_heartbeat(project_hash: String) -> HeartbeatGuard {
 
 // ── Provisioning helpers ──────────────────────────────────────────────
 
-/// True if the error is Hetzner's "this server-type isn't currently
-/// available in this location" capacity signal (HTTP 412 + JSON body
-/// containing `code: "resource_unavailable"`).
-///
-/// Brittle by design: we deliberately don't broaden the predicate. A
-/// 412 with a different code (e.g. `unsupported_error`, `invalid_input`)
-/// means something we can't fix by trying another region, and silently
-/// retrying would mask real problems.
-fn is_capacity_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("resource_unavailable")
-}
-
 /// Read the project's existing volume's region without touching state.
 /// Used to bias the region-attempt order toward "wherever the cache
 /// already is" so a non-fallback run is identical to the pre-fallback
 /// behaviour: same region every time, no migration churn.
 async fn peek_volume_region(
-    hcloud: &HCloud,
+    provider: &dyn Provider,
     project: &ProjectKey,
     state: &State,
 ) -> Option<String> {
     if let Some(p) = state.projects.get(&project.hash) {
-        if let Some(id) = p.volume_id {
-            if let Ok(v) = hcloud.get_volume(id).await {
-                return v.location;
+        if let Some(id) = p.volume_id.as_ref() {
+            if let Ok(Some(v)) = provider.get_volume(id).await {
+                return v.region;
             }
         }
     }
     // State-less recovery path: volume might exist by name even if our
     // local state.json was deleted.
-    match hcloud.find_volume(&project.volume_name()).await {
-        Ok(Some(v)) => v.location,
+    match provider.find_volume(&project.volume_name()).await {
+        Ok(Some(v)) => v.region,
         _ => None,
     }
 }
@@ -504,33 +494,34 @@ fn compute_attempt_regions(cfg: &Config, existing_volume_region: Option<&str>) -
 }
 
 async fn ensure_volume(
-    hcloud: &HCloud,
+    provider: &dyn Provider,
     cfg: &Config,
     project: &ProjectKey,
     state: &mut State,
     target_region: &str,
-) -> Result<(Volume, bool)> {
+) -> Result<(VolumeInfo, bool)> {
+    let provider_name = provider.name();
     let p = state.projects.get_mut(&project.hash).expect("inserted earlier");
 
     // (1) Try the volume cached in state. Region match → reuse;
     // mismatch → orphan + delete (we can't attach across regions),
     // not-found → forget and fall through.
-    if let Some(id) = p.volume_id {
-        match hcloud.get_volume(id).await {
-            Ok(v) => {
-                if v.location.as_deref() == Some(target_region) {
+    if let Some(id) = p.volume_id.clone() {
+        match provider.get_volume(&id).await {
+            Ok(Some(v)) => {
+                if v.region.as_deref() == Some(target_region) {
                     return Ok((v, false));
                 }
                 tracing::warn!(
-                    volume = v.id,
-                    volume_region = ?v.location,
+                    volume = %v.id,
+                    volume_region = ?v.region,
                     server_region = target_region,
                     "abandoning project volume — server fell back to a different region; \
                      cache will rebuild on this run (~30s penalty)"
                 );
-                if let Err(e) = hcloud.delete_volume(v.id).await {
+                if let Err(e) = provider.delete_volume(&v.id).await {
                     tracing::warn!(
-                        volume = v.id,
+                        volume = %v.id,
                         error = %e,
                         "could not delete cross-region volume; you may need to clean it up manually"
                     );
@@ -538,17 +529,30 @@ async fn ensure_volume(
                 crate::audit::end_volume_session(
                     p,
                     &project.hash,
-                    v.id,
+                    &v.id,
+                    provider_name,
+                    crate::audit::TerminationReason::Stale,
+                );
+                p.volume_id = None;
+            }
+            Ok(None) => {
+                tracing::warn!("volume {id} from state.json no longer exists upstream; will recreate");
+                crate::audit::end_volume_session(
+                    p,
+                    &project.hash,
+                    &id,
+                    provider_name,
                     crate::audit::TerminationReason::Stale,
                 );
                 p.volume_id = None;
             }
             Err(e) => {
-                tracing::warn!("volume {id} from state.json not found ({e}); will recreate");
+                tracing::warn!("volume {id} lookup failed ({e}); will recreate");
                 crate::audit::end_volume_session(
                     p,
                     &project.hash,
-                    id,
+                    &id,
+                    provider_name,
                     crate::audit::TerminationReason::Stale,
                 );
                 p.volume_id = None;
@@ -557,22 +561,21 @@ async fn ensure_volume(
     }
 
     // (2) Try by name (state.json may be stale or freshly recreated).
-    // Same region rules as above.
-    if let Some(v) = hcloud.find_volume(&project.volume_name()).await? {
-        if v.location.as_deref() == Some(target_region) {
-            tracing::info!(id = v.id, "found existing volume by name");
-            p.volume_id = Some(v.id);
+    if let Some(v) = provider.find_volume(&project.volume_name()).await? {
+        if v.region.as_deref() == Some(target_region) {
+            tracing::info!(id = %v.id, "found existing volume by name");
+            p.volume_id = Some(v.id.clone());
             return Ok((v, false));
         }
         tracing::warn!(
-            volume = v.id,
-            volume_region = ?v.location,
+            volume = %v.id,
+            volume_region = ?v.region,
             server_region = target_region,
             "deleting by-name volume in wrong region"
         );
-        if let Err(e) = hcloud.delete_volume(v.id).await {
+        if let Err(e) = provider.delete_volume(&v.id).await {
             tracing::warn!(
-                volume = v.id,
+                volume = %v.id,
                 error = %e,
                 "could not delete cross-region volume; you may need to clean it up manually"
             );
@@ -586,34 +589,27 @@ async fn ensure_volume(
         region = target_region,
         "creating new volume"
     );
-    let mut labels = HashMap::new();
+    let mut labels = BTreeMap::new();
     labels.insert("managed-by".into(), "cargo-burst".into());
     labels.insert("project-hash".into(), project.hash.clone());
-    let resp = hcloud
-        .create_volume(CreateVolumeRequest {
+    let info = provider
+        .create_volume(VolumeSpec {
             name: project.volume_name(),
-            size: cfg.volume_gb,
-            location: target_region.to_string(),
-            format: "ext4".into(),
+            size_gb: cfg.volume_gb,
+            region: target_region.to_string(),
             labels,
-            automount: false,
         })
         .await?;
-    if let Some(action) = resp.action {
-        hcloud.wait_action(action.id, Duration::from_secs(120)).await?;
-    }
-    for action in resp.next_actions {
-        hcloud.wait_action(action.id, Duration::from_secs(120)).await?;
-    }
-    p.volume_id = Some(resp.volume.id);
+    p.volume_id = Some(info.id.clone());
     crate::audit::begin_volume_session(
         p,
         &project.hash,
-        resp.volume.id,
+        info.id.clone(),
+        provider_name,
         cfg.volume_gb,
         target_region,
     );
-    Ok((resp.volume, true))
+    Ok((info, true))
 }
 
 /// Provision (or reuse) the shared server, trying each region in
@@ -625,140 +621,130 @@ async fn ensure_volume(
 /// state, or by name lookup) we just hand it back; the region we
 /// return is read from the server's `datacenter.location.name`.
 async fn ensure_shared_server(
-    hcloud: &HCloud,
+    provider: &dyn Provider,
     cfg: &Config,
-    image_id: i64,
-    ssh_key_id: i64,
+    image_id: &crate::provider::ImageId,
+    ssh_key_id: &SshKeyId,
     state: &mut State,
     attempt_regions: &[String],
-) -> Result<(Server, bool, String)> {
-    fn server_region(server: &Server, fallback: &str) -> String {
-        server
-            .datacenter
-            .as_ref()
-            .map(|d| d.location.name.clone())
-            .unwrap_or_else(|| fallback.to_string())
-    }
-    // Fallback only if Hetzner returns a Server without `datacenter`
-    // (we haven't observed this in practice, but the field is `Option`).
-    // `attempt_regions` is non-empty in every reachable code path —
-    // the empty case errors out below — so `.first()` is effectively
-    // infallible here.
+) -> Result<(ServerInfo, bool, String)> {
     let region_fallback: &str = attempt_regions
         .first()
         .map(String::as_str)
         .unwrap_or("unknown");
 
-    if let Some(id) = state.server_id {
-        match hcloud.get_server(id).await {
-            Ok(s) if matches!(s.status.as_str(), "running" | "starting" | "initializing") => {
-                let region = server_region(&s, region_fallback);
-                tracing::info!(id, status = %s.status, region = %region, "reusing shared server from state");
+    let server_region = |s: &ServerInfo| -> String {
+        s.region.clone().unwrap_or_else(|| region_fallback.to_string())
+    };
+
+    if let Some(id) = state.server_id.clone() {
+        match provider.get_server(&id).await {
+            Ok(Some(s)) if s.status.is_alive() => {
+                let region = server_region(&s);
+                tracing::info!(id = %id, status = s.status.as_str(), region = %region, "reusing shared server from state");
                 return Ok((s, false, region));
             }
-            Ok(s) => {
-                tracing::warn!(id, status = %s.status, "stale server in state; deleting");
-                let _ = hcloud.delete_server(id).await;
-                crate::audit::end_server_session(state, id, crate::audit::TerminationReason::Stale);
+            Ok(Some(s)) => {
+                tracing::warn!(id = %id, status = s.status.as_str(), "stale server in state; deleting");
+                let _ = provider.delete_server(&id).await;
+                crate::audit::end_server_session(state, &id, crate::audit::TerminationReason::Stale);
+                state.server_id = None;
+            }
+            Ok(None) => {
+                tracing::warn!("server {id} from state.json no longer exists upstream; will recreate");
+                crate::audit::end_server_session(state, &id, crate::audit::TerminationReason::Stale);
                 state.server_id = None;
             }
             Err(e) => {
-                tracing::warn!("server {id} from state.json not found ({e}); will recreate");
-                // Server vanished server-side. Close the lifetime
-                // ledger so the next provision starts a fresh session.
-                crate::audit::end_server_session(state, id, crate::audit::TerminationReason::Stale);
+                tracing::warn!("server {id} lookup failed ({e}); will recreate");
+                crate::audit::end_server_session(state, &id, crate::audit::TerminationReason::Stale);
                 state.server_id = None;
             }
         }
     }
 
-    if let Some(s) = hcloud.find_server(SHARED_SERVER_NAME).await? {
-        if matches!(s.status.as_str(), "running" | "starting" | "initializing") {
-            let region = server_region(&s, region_fallback);
-            tracing::info!(id = s.id, status = %s.status, region = %region, "found shared server by name");
-            state.server_id = Some(s.id);
+    if let Some(s) = provider.find_server(SHARED_SERVER_NAME).await? {
+        if s.status.is_alive() {
+            let region = server_region(&s);
+            tracing::info!(id = %s.id, status = s.status.as_str(), region = %region, "found shared server by name");
+            state.server_id = Some(s.id.clone());
             return Ok((s, false, region));
         }
-        tracing::warn!(id = s.id, status = %s.status, "deleting stale server found by name");
-        let _ = hcloud.delete_server(s.id).await;
-        crate::audit::end_server_session(state, s.id, crate::audit::TerminationReason::Stale);
+        tracing::warn!(id = %s.id, status = s.status.as_str(), "deleting stale server found by name");
+        let id_clone = s.id.clone();
+        let _ = provider.delete_server(&id_clone).await;
+        crate::audit::end_server_session(state, &id_clone, crate::audit::TerminationReason::Stale);
     }
 
-    // Provisioning loop: try each region in preference order, fall
-    // through capacity errors only. Other errors (auth, quota, network)
-    // won't get better by changing region, so propagate immediately.
     if attempt_regions.is_empty() {
         return Err(anyhow!(
-            "no regions configured for provisioning (set `regions = [\"hel1\", …]` in config.toml)"
+            "no regions configured for provisioning (set `regions = [...]` in config.toml)"
         ));
     }
-    let mut last_err: Option<anyhow::Error> = None;
+    let server_type = cfg.server_type();
+    let provider_name = provider.name();
     for region in attempt_regions {
         tracing::info!(
             name = SHARED_SERVER_NAME,
-            image = image_id,
-            server_type = %cfg.server_type,
+            image = %image_id,
+            server_type = %server_type,
             region = %region,
             "provisioning shared server"
         );
-        let mut labels = HashMap::new();
+        let mut labels = BTreeMap::new();
         labels.insert("managed-by".into(), "cargo-burst".into());
         labels.insert("role".into(), "shared".into());
-        let res = hcloud
-            .create_server(CreateServerRequest {
-                name: SHARED_SERVER_NAME.to_string(),
-                server_type: cfg.server_type.clone(),
-                image: ImageRef::Id(image_id),
-                location: region.clone(),
-                ssh_keys: vec![ssh_key_id],
-                volumes: vec![],
-                user_data: None,
-                labels,
-                start_after_create: true,
-            })
-            .await;
-        match res {
-            Ok(create) => {
-                hcloud
-                    .wait_action(create.action.id, SERVER_BOOT_TIMEOUT)
-                    .await
-                    .context("waiting for server-create action")?;
-                let server = hcloud.get_server(create.server.id).await?;
-                state.server_id = Some(server.id);
+        let spec = ServerSpec {
+            name: SHARED_SERVER_NAME.to_string(),
+            server_type: server_type.clone(),
+            image: image_id.clone(),
+            region: region.clone(),
+            ssh_keys: vec![ssh_key_id.clone()],
+            user_data: None,
+            labels,
+            attached_volumes: Vec::new(),
+        };
+        match provider.create_server(spec).await {
+            Ok(info) => {
+                state.server_id = Some(info.id.clone());
                 crate::audit::begin_server_session(
                     state,
-                    server.id,
-                    &cfg.server_type,
-                    image_id,
+                    info.id.clone(),
+                    provider_name,
+                    &server_type,
+                    image_id.clone(),
                     region,
                 );
-                return Ok((server, true, region.clone()));
+                return Ok((info, true, region.clone()));
             }
-            Err(e) if is_capacity_error(&e) => {
-                tracing::warn!(region = %region, error = %e, "region at capacity; trying next");
-                last_err = Some(e);
+            Err(ProvisionError::NoCapacity { .. }) => {
+                tracing::warn!(region = %region, "region at capacity; trying next");
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(ProvisionError::Other(e)) => return Err(e),
         }
     }
     Err(anyhow!(
-        "every region in the preference list ({:?}) reported `resource_unavailable`; \
+        "every region in the preference list ({:?}) reported no capacity; \
          try again later, or add another region to your config",
         attempt_regions
-    )
-    .context(last_err.unwrap_or_else(|| anyhow!("no last error captured"))))
+    ))
 }
 
 async fn ensure_volume_attached(
-    hcloud: &HCloud,
-    volume: Volume,
-    server_id: i64,
-) -> Result<Volume> {
-    match volume.server {
+    provider: &dyn Provider,
+    volume: &VolumeInfo,
+    server_id: &crate::provider::ServerId,
+) -> Result<crate::provider::AttachedDevice> {
+    match volume.attached_to.as_ref() {
         Some(id) if id == server_id => {
-            tracing::info!(volume = volume.id, "volume already attached to shared server");
-            Ok(volume)
+            tracing::info!(volume = %volume.id, "volume already attached to shared server");
+            // Already attached, but we still need to know the device
+            // path. For Hetzner the formula is deterministic from the
+            // volume ID; we recover it by issuing a fresh attach (the
+            // call is idempotent — Hetzner returns success when the
+            // volume is already attached to the requested server).
+            provider.attach_volume(&volume.id, server_id).await
         }
         Some(other) => Err(anyhow!(
             "volume {} is attached to server {other}, not the shared server {server_id}. \
@@ -766,33 +752,35 @@ async fn ensure_volume_attached(
             volume.id
         )),
         None => {
-            tracing::info!(volume = volume.id, server = server_id, "attaching volume");
-            hcloud.attach_volume(volume.id, server_id).await?;
-            hcloud.get_volume(volume.id).await
+            tracing::info!(volume = %volume.id, server = %server_id, "attaching volume");
+            provider.attach_volume(&volume.id, server_id).await
         }
     }
 }
 
-/// Render the inline mount script we ssh-execute. Idempotent: short-
-/// circuits if already mounted, formats ext4 on first use, waits up to
-/// ~10s for the device file to appear after attach.
-fn render_mount_script(volume_id: i64, hash: &str) -> String {
+/// Render the inline mount script we ssh-execute. The device path is
+/// provider-specific (Hetzner: `/dev/disk/by-id/scsi-0HC_Volume_<id>`,
+/// AWS Nitro: `/dev/nvme<N>n1`) and is passed in by the caller.
+/// Idempotent: short-circuits if already mounted, formats ext4 on
+/// first use, waits up to ~10s for the device file to appear.
+fn render_mount_script(device_path: &str, hash: &str) -> String {
     format!(
         r#"sudo bash -s <<'BURST_MOUNT'
 set -euo pipefail
 target=/mnt/cache/{hash}
-dev=/dev/disk/by-id/scsi-0HC_Volume_{volume_id}
+dev={device_path}
 
 if mountpoint -q "$target"; then
     exit 0
 fi
 
-for _ in $(seq 1 20); do
+for _ in $(seq 1 30); do
     [ -e "$dev" ] && break
-    sleep 0.5
+    sleep 1
 done
 if [ ! -e "$dev" ]; then
-    echo "volume {volume_id} not attached (device $dev never appeared)" >&2
+    echo "device $dev never appeared (volume not attached?)" >&2
+    ls -la /dev/disk/by-id/ 2>&1 >&2 || true
     exit 1
 fi
 
@@ -1455,10 +1443,14 @@ mod tests {
 
     fn cfg_with(region: &str, regions: &[&str]) -> Config {
         Config {
-            hetzner_token: "x".into(),
-            region: vec![region.into()],
-            regions: regions.iter().map(|s| s.to_string()).collect(),
-            server_type: "ccx63".into(),
+            provider: crate::config::ProviderKind::Hetzner,
+            hetzner: Some(crate::config::HetznerConfig {
+                token: "x".into(),
+                region: vec![region.into()],
+                regions: regions.iter().map(|s| s.to_string()).collect(),
+                server_type: "ccx63".into(),
+            }),
+            aws: None,
             keep_alive_secs: 300,
             volume_keep_alive_secs: 3600,
             volume_gb: 200,
@@ -1600,7 +1592,7 @@ mod tests {
              {{\"error\":{{\"code\":\"resource_unavailable\",\
              \"message\":\"error during placement\",\"details\":{{}}}}}}"
         );
-        assert!(is_capacity_error(&e));
+        assert!(crate::provider::hcloud::is_capacity_error(&e));
     }
 
     #[test]
@@ -1650,9 +1642,9 @@ mod tests {
         // Different 412 codes mean things we can't fix by trying
         // another region — must surface to the user.
         let e = anyhow!("POST → 412 Precondition Failed: code:\"invalid_input\"");
-        assert!(!is_capacity_error(&e));
+        assert!(!crate::provider::hcloud::is_capacity_error(&e));
         let e = anyhow!("POST → 401 Unauthorized");
-        assert!(!is_capacity_error(&e));
+        assert!(!crate::provider::hcloud::is_capacity_error(&e));
     }
 
     /// Pick env var names with a `CARGO_BURST_TEST_` prefix so we don't

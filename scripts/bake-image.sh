@@ -351,23 +351,35 @@ EOFINNER
 install -d -m 0755 /mnt/cache
 cat > /usr/local/bin/cargo-burst-mount-volume <<'EOF'
 #!/bin/bash
-# Mount the (single) attached Hetzner volume at /mnt/cache. Idempotent.
+# Mount the attached project volume at /mnt/cache. Idempotent.
+#
+# The device path comes from the controller — it's provider-specific:
+#   Hetzner: /dev/disk/by-id/scsi-0HC_Volume_<id>
+#   AWS:     /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol<id-no-dashes>
+# Both forms are stable udev symlinks, so the controller just passes
+# the path it computed at attach time.
 set -euo pipefail
+dev="${1:?usage: cargo-burst-mount-volume <device-path>}"
 target=/mnt/cache
 if mountpoint -q "$target"; then
     exit 0
 fi
-# Hetzner exposes attached volumes as /dev/disk/by-id/scsi-0HC_Volume_<id>.
-# We assume there's exactly one volume attached at any given time (the
-# project's target/ cache); pick the first match.
-dev="$(ls /dev/disk/by-id/scsi-0HC_Volume_* 2>/dev/null | head -n1)"
-if [ -z "$dev" ]; then
-    echo "no Hetzner volume attached" >&2
+# udev creates the by-id symlink asynchronously after attach. Wait
+# up to 30s for it to appear (typical: <1s, but spot/Nitro instances
+# under load occasionally take longer).
+for _ in $(seq 1 30); do
+    if [ -e "$dev" ]; then break; fi
+    sleep 1
+done
+if [ ! -e "$dev" ]; then
+    echo "device $dev did not appear within 30s" >&2
+    ls -la /dev/disk/by-id/ 2>&1 >&2 || true
     exit 1
 fi
 # If the volume hasn't been formatted yet (very first attach for a new
 # project), give it ext4 now. Hetzner's `format=ext4` create-time option
-# usually handles this, but we double-check so manual-volume cases still work.
+# handles this for hcloud volumes; AWS EBS volumes are always raw on
+# first attach.
 if ! blkid "$dev" >/dev/null 2>&1; then
     mkfs.ext4 -q -L cargo-burst-cache "$dev"
 fi
@@ -377,53 +389,71 @@ install -d -o work -g work "$target/target" "$target/sccache"
 EOF
 chmod 0755 /usr/local/bin/cargo-burst-mount-volume
 
-# Trim slow-but-useless services from the runtime boot path. The image is
-# fully baked at this point — cloud-init has nothing to do on subsequent
-# boots, and we don't ship anything via snap. On a baked Ubuntu 24.04 image
-# `systemd-analyze blame` showed:
+# Trim slow-but-useless services from the runtime boot path.
+#
+# IMPORTANT: cloud-init must stay enabled on AWS. AWS depends on cloud-init
+# on every first boot of an AMI to: (a) write per-instance netplan config
+# matched to the assigned ENI MAC, (b) regenerate SSH host keys so two
+# instances launched from the same AMI don't share keys, (c) re-set the
+# hostname. Without cloud-init the AMI boots with the bake VM's stale
+# network config and is completely unreachable. We detect AWS via the EC2
+# metadata service and skip the cloud-init opt-out on that branch.
+#
+# On Hetzner there's no equivalent first-boot dependency, so disabling
+# cloud-init saves ~6s off userspace boot:
 #
 #   3.318s cloud-init.service
 #   1.698s systemd-networkd-wait-online.service
 #   1.599s cloud-init-local.service
 #     602ms snapd.seeded.service
-#
-# Disabling all of these shaves ~6s off userspace boot, which means
-# `wait_for_ssh` returns ~6s sooner on every cold start.
-echo "[cargo-burst] disabling cloud-init for the runtime image"
-# Standard cloud-init opt-out: presence of this file makes cloud-init
-# exit immediately on every boot.
-mkdir -p /etc/cloud
-touch /etc/cloud/cloud-init.disabled
-# Belt-and-braces: mask the units too. mask is stronger than disable —
-# even unit-name aliases can't pull these in.
-systemctl mask cloud-init.service cloud-init-local.service \
-                cloud-config.service cloud-final.service \
-                cloud-init-network.service 2>/dev/null || true
+IS_AWS=0
+if curl -fsS --max-time 2 -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+        -X PUT http://169.254.169.254/latest/api/token >/dev/null 2>&1; then
+    IS_AWS=1
+fi
+if [ "$IS_AWS" = 1 ]; then
+    echo "[cargo-burst] detected AWS — leaving cloud-init enabled for runtime"
+    # cloud-init clean (line below in this script) will reset per-instance
+    # state, so the next boot of a new instance from this AMI runs all
+    # cloud-init stages fresh. That's exactly what AWS expects.
+else
+    echo "[cargo-burst] non-AWS — disabling cloud-init for the runtime image"
+    # Standard cloud-init opt-out: presence of this file makes cloud-init
+    # exit immediately on every boot.
+    mkdir -p /etc/cloud
+    touch /etc/cloud/cloud-init.disabled
+    # Belt-and-braces: mask the units too. mask is stronger than disable —
+    # even unit-name aliases can't pull these in.
+    systemctl mask cloud-init.service cloud-init-local.service \
+                    cloud-config.service cloud-final.service \
+                    cloud-init-network.service 2>/dev/null || true
+fi
 
-# Pin DNS to 1.1.1.1 / 1.0.0.1 ourselves.
+# Pin DNS to 1.1.1.1 / 1.0.0.1 ourselves on non-AWS providers.
 #
-# With cloud-init disabled, nothing rewrites /etc/resolv.conf each boot.
-# On stock Ubuntu 24.04 cloud images /etc/resolv.conf is a symlink into
-# /run/systemd/resolve/stub-resolv.conf (127.0.0.53), which is only useful
-# if systemd-resolved has an upstream configured — and that upstream
-# normally comes from DHCP options that cloud-init/networkd negotiate at
-# boot. With cloud-init off, the symlink target may be stale or empty and
-# we get "Could not resolve host" errors mid-build.
+# On Hetzner: cloud-init is masked above, so nothing rewrites
+# /etc/resolv.conf each boot. On stock Ubuntu 24.04 cloud images
+# /etc/resolv.conf is a symlink into /run/systemd/resolve/stub-resolv.conf
+# (127.0.0.53), which is only useful if systemd-resolved has an upstream
+# configured — and that upstream normally comes from DHCP options that
+# cloud-init/networkd negotiate at boot. With cloud-init off, the symlink
+# target may be stale or empty and we get "Could not resolve host"
+# errors mid-build.
 #
-# Simpler than reviving a slice of cloud-init: replace the symlink with
-# a static resolv.conf pointing at Cloudflare. A build server only needs
-# to reach the public internet (crates.io, GitHub) — there's no internal
-# Hetzner-private DNS we'd lose by skipping DHCP-supplied resolvers.
-echo "[cargo-burst] pinning /etc/resolv.conf to 1.1.1.1 / 1.0.0.1"
-rm -f /etc/resolv.conf
-cat > /etc/resolv.conf <<'RESOLV'
+# On AWS: cloud-init re-writes /etc/resolv.conf on every first boot via
+# its DHCP-supplied resolvers, so we leave the stock symlink alone.
+if [ "$IS_AWS" = 0 ]; then
+    echo "[cargo-burst] pinning /etc/resolv.conf to 1.1.1.1 / 1.0.0.1"
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf <<'RESOLV'
 # Static resolvers — written by cargo-burst bake. cloud-init is masked
 # on this image, so nothing else will rewrite this file at boot.
 nameserver 1.1.1.1
 nameserver 1.0.0.1
 options edns0 trust-ad
 RESOLV
-chmod 0644 /etc/resolv.conf
+    chmod 0644 /etc/resolv.conf
+fi
 
 echo "[cargo-burst] removing snapd"
 # snapd.seeded.service sits on the critical chain to multi-user.target on
@@ -446,7 +476,18 @@ fi
 # inflate the image by hundreds of MB.
 apt-get clean
 rm -rf /var/lib/apt/lists/*
+
+# Reset per-instance state so the next boot from this AMI looks like a
+# fresh install:
+#   - cloud-init's per-instance state (so AWS first-boot stages run again)
+#   - /etc/machine-id (so systemd generates a new one on first boot — two
+#     instances launched from the same AMI must not share machine-id)
+#   - SSH host keys (likewise — sharing host keys across instances is
+#     both a security smell and trips client warnings)
 cloud-init clean --logs || true
+truncate -s 0 /etc/machine-id
+rm -f /var/lib/dbus/machine-id
+rm -f /etc/ssh/ssh_host_*
 
 echo "[cargo-burst] bake complete; powering off"
 # Schedule the shutdown so cloud-init has time to flush its own state
