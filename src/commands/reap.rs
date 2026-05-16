@@ -56,8 +56,14 @@ pub async fn run_server(args: ReapServerArgs) -> Result<()> {
 
     tokio::time::sleep(Duration::from_secs(args.after_secs)).await;
 
-    let _lock = StateLock::acquire().await?;
+    // Lock discipline: the state lock guards `state.json`, nothing else.
+    // It must NEVER be held across AWS / provider API calls — those can
+    // stall on retries against a torn-down instance and would deadlock
+    // every concurrent `cargo burst` invocation. Every block below that
+    // takes the lock either reads-and-decides or writes-and-returns;
+    // none of them straddle a provider call.
 
+    // (1) Snapshot the bits we need under the lock, then drop it.
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -65,44 +71,64 @@ pub async fn run_server(args: ReapServerArgs) -> Result<()> {
             return Ok(());
         }
     };
-    let state = match State::load() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("server-reaper: failed to load state ({e}); leaving server alive");
-            return Ok(());
-        }
-    };
-
-    // (1) State may have already been overwritten with a different
-    // server_id. If so, bow out without re-spawning.
-    if state.server_id.as_ref() != Some(&server_id) {
-        tracing::info!(
-            ours = %server_id,
-            current = ?state.server_id,
-            "server-reaper: state.server_id no longer matches; bowing out"
-        );
-        return Ok(());
+    enum InitialDecision {
+        Bow,
+        Respawn,
+        Proceed {
+            session_started_at: Option<String>,
+        },
     }
-
-    // (2) Activity-since-spawn check. If anything ran in the window,
-    // re-spawn a successor.
-    if let Some(last) = state.last_used_any() {
-        if last > spawn_time {
+    let decision = {
+        let _lock = StateLock::acquire().await?;
+        let state = match State::load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "server-reaper: failed to load state ({e}); leaving server alive"
+                );
+                return Ok(());
+            }
+        };
+        if state.server_id.as_ref() != Some(&server_id) {
             tracing::info!(
-                "server-reaper: activity at {last} > spawn {spawn_time}; \
-                 re-spawning successor reaper"
+                ours = %server_id,
+                current = ?state.server_id,
+                "server-reaper: state.server_id no longer matches; bowing out"
             );
-            drop(_lock);
+            InitialDecision::Bow
+        } else if state
+            .last_used_any()
+            .is_some_and(|last| last > spawn_time)
+        {
+            tracing::info!(
+                last_used = ?state.last_used_any(),
+                spawn = %spawn_time,
+                "server-reaper: activity since spawn; re-spawning successor"
+            );
+            InitialDecision::Respawn
+        } else {
+            let session_started_at = state
+                .current_server_session
+                .as_ref()
+                .filter(|s| s.server_id == server_id)
+                .map(|s| s.started_at.clone());
+            InitialDecision::Proceed { session_started_at }
+        }
+        // _lock drops here.
+    };
+    let session_started_at = match decision {
+        InitialDecision::Bow => return Ok(()),
+        InitialDecision::Respawn => {
             if let Err(e) = spawn_server(server_id, args.after_secs) {
                 tracing::error!("server-reaper: failed to re-spawn successor: {e}");
             }
             return Ok(());
         }
-    }
+        InitialDecision::Proceed { session_started_at } => session_started_at,
+    };
 
-    // (3) Billing-minimum gate. Construct the provider so we can read
-    // its billing_minimum, then wait out the remaining paid time if
-    // any. The session record carries the provisioning timestamp.
+    // (2) Provider construction — outside the lock. SDK init can do
+    // credential resolution / network calls.
     let provider = match provider::from_config(&cfg).await {
         Ok(p) => p,
         Err(e) => {
@@ -110,80 +136,71 @@ pub async fn run_server(args: ReapServerArgs) -> Result<()> {
             return Ok(());
         }
     };
+
+    // (3) Billing-minimum gate — also outside the lock. We only sleep.
     let billing_min = provider.billing_minimum();
     if billing_min > Duration::from_secs(0) {
-        if let Some(session) = state.current_server_session.as_ref() {
-            if session.server_id == server_id {
-                if let Ok(created) = time::OffsetDateTime::parse(
-                    &session.started_at,
-                    &time::format_description::well_known::Rfc3339,
-                ) {
-                    let now = time::OffsetDateTime::now_utc();
-                    let earliest = created
-                        + time::Duration::seconds(billing_min.as_secs() as i64)
-                        - time::Duration::seconds(BILLING_SAFETY_MARGIN.as_secs() as i64);
-                    if now < earliest {
-                        let wait = earliest - now;
-                        let wait_secs = wait.whole_seconds().max(0) as u64;
-                        tracing::info!(
-                            "server-reaper: holding server until billing minimum elapses \
-                             ({wait_secs}s remaining of paid window)"
-                        );
-                        drop(_lock);
-                        tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-                        // Re-acquire lock + re-check activity. If
-                        // anyone bumped last_used during our extra
-                        // wait, fall through into the re-spawn path
-                        // by recursing through a fresh successor.
-                        let _lock2 = StateLock::acquire().await?;
+        if let Some(started_at) = session_started_at.as_deref() {
+            if let Ok(created) = time::OffsetDateTime::parse(
+                started_at,
+                &time::format_description::well_known::Rfc3339,
+            ) {
+                let now = time::OffsetDateTime::now_utc();
+                let earliest = created
+                    + time::Duration::seconds(billing_min.as_secs() as i64)
+                    - time::Duration::seconds(BILLING_SAFETY_MARGIN.as_secs() as i64);
+                if now < earliest {
+                    let wait_secs = (earliest - now).whole_seconds().max(0) as u64;
+                    tracing::info!(
+                        "server-reaper: holding server until billing minimum elapses \
+                         ({wait_secs}s remaining of paid window)"
+                    );
+                    tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                    // Re-check activity after the extra sleep. If anyone
+                    // used the server during the billing wait, hand off
+                    // to a successor rather than killing it.
+                    let respawn = {
+                        let _lock = StateLock::acquire().await?;
                         let state2 = State::load()?;
                         if state2.server_id.as_ref() != Some(&server_id) {
                             return Ok(());
                         }
-                        if let Some(last) = state2.last_used_any() {
-                            // "Activity since now-ish" — anything
-                            // after the original spawn time still
-                            // counts. We re-spawn instead of deleting.
-                            if last > spawn_time {
-                                drop(_lock2);
-                                if let Err(e) =
-                                    spawn_server(server_id, args.after_secs)
-                                {
-                                    tracing::error!(
-                                        "server-reaper: failed to re-spawn after \
-                                         billing wait: {e}"
-                                    );
-                                }
-                                return Ok(());
-                            }
+                        state2.last_used_any().is_some_and(|last| last > spawn_time)
+                    };
+                    if respawn {
+                        if let Err(e) = spawn_server(server_id, args.after_secs) {
+                            tracing::error!(
+                                "server-reaper: failed to re-spawn after billing wait: {e}"
+                            );
                         }
-                        // Fall through to the delete path below,
-                        // with the lock held by _lock2.
-                        drop(_lock2);
+                        return Ok(());
                     }
                 }
             }
         }
     }
 
-    // (4) Delete.
+    // (4) Delete — outside the lock. AWS retries can take many seconds.
     if let Err(e) = provider.delete_server(&server_id).await {
         tracing::error!("server-reaper: failed to delete server {server_id}: {e}");
         return Ok(());
     }
     tracing::info!("server-reaper: deleted shared server {server_id}");
 
-    let _lock3 = StateLock::acquire().await?;
-    let mut state = State::load()?;
-    if state.server_id.as_ref() == Some(&server_id) {
-        state.server_id = None;
+    // (5) Final state mutation under a fresh, short lock acquisition.
+    {
+        let _lock = StateLock::acquire().await?;
+        let mut state = State::load()?;
+        if state.server_id.as_ref() == Some(&server_id) {
+            state.server_id = None;
+        }
+        crate::audit::end_server_session(
+            &mut state,
+            &server_id,
+            crate::audit::TerminationReason::Reap,
+        );
+        state.save().ok();
     }
-    crate::audit::end_server_session(
-        &mut state,
-        &server_id,
-        crate::audit::TerminationReason::Reap,
-    );
-    state.save().ok();
     Ok(())
 }
 
@@ -217,8 +234,8 @@ pub async fn run_volume(args: ReapVolumeArgs) -> Result<()> {
     let spawn_time = time::OffsetDateTime::now_utc();
     tokio::time::sleep(Duration::from_secs(args.after_secs)).await;
 
-    let _lock = StateLock::acquire().await?;
-
+    // Same lock discipline as run_server: lock only for state.json
+    // reads/writes, never across provider API calls.
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -226,55 +243,70 @@ pub async fn run_volume(args: ReapVolumeArgs) -> Result<()> {
             return Ok(());
         }
     };
-    let state = match State::load() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("volume-reaper: failed to load state ({e}); leaving volume alive");
-            return Ok(());
-        }
-    };
-
-    let project = match state.projects.get(&args.project_hash) {
-        Some(p) => p,
-        None => {
+    enum InitialDecision {
+        Bow,
+        Respawn,
+        Proceed,
+    }
+    let decision = {
+        let _lock = StateLock::acquire().await?;
+        let state = match State::load() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    "volume-reaper: failed to load state ({e}); leaving volume alive"
+                );
+                return Ok(());
+            }
+        };
+        let Some(project) = state.projects.get(&args.project_hash) else {
             tracing::info!(
                 hash = %args.project_hash,
                 "volume-reaper: project no longer in state; bowing out"
             );
             return Ok(());
-        }
-    };
-    if project.volume_id.as_ref() != Some(&volume_id) {
-        tracing::info!(
-            ours = %volume_id,
-            current = ?project.volume_id,
-            hash = %args.project_hash,
-            "volume-reaper: state.projects[hash].volume_id no longer matches; bowing out"
-        );
-        return Ok(());
-    }
-
-    if let Some(last) = project.last_used_rfc3339.as_deref() {
-        if let Ok(parsed) =
-            time::OffsetDateTime::parse(last, &time::format_description::well_known::Rfc3339)
+        };
+        if project.volume_id.as_ref() != Some(&volume_id) {
+            tracing::info!(
+                ours = %volume_id,
+                current = ?project.volume_id,
+                hash = %args.project_hash,
+                "volume-reaper: state.projects[hash].volume_id no longer matches; bowing out"
+            );
+            InitialDecision::Bow
+        } else if project
+            .last_used_rfc3339
+            .as_deref()
+            .and_then(|s| {
+                time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .is_some_and(|parsed| parsed > spawn_time)
         {
-            if parsed > spawn_time {
-                tracing::info!(
-                    hash = %args.project_hash,
-                    "volume-reaper: activity at {parsed} > spawn {spawn_time}; \
-                     re-spawning successor reaper"
-                );
-                drop(_lock);
-                if let Err(e) =
-                    spawn_volume(volume_id, args.project_hash.clone(), args.after_secs)
-                {
-                    tracing::error!("volume-reaper: failed to re-spawn successor: {e}");
-                }
-                return Ok(());
-            }
+            tracing::info!(
+                hash = %args.project_hash,
+                "volume-reaper: activity since spawn; re-spawning successor"
+            );
+            InitialDecision::Respawn
+        } else {
+            InitialDecision::Proceed
         }
+        // _lock drops here.
+    };
+    match decision {
+        InitialDecision::Bow => return Ok(()),
+        InitialDecision::Respawn => {
+            if let Err(e) =
+                spawn_volume(volume_id, args.project_hash.clone(), args.after_secs)
+            {
+                tracing::error!("volume-reaper: failed to re-spawn successor: {e}");
+            }
+            return Ok(());
+        }
+        InitialDecision::Proceed => {}
     }
 
+    // Provider init + AWS calls — outside the lock.
     let provider = match provider::from_config(&cfg).await {
         Ok(p) => p,
         Err(e) => {
@@ -297,20 +329,24 @@ pub async fn run_volume(args: ReapVolumeArgs) -> Result<()> {
         "volume-reaper: deleted idle project volume"
     );
 
+    // Final state write under a fresh, short lock acquisition.
     let provider_name = provider.name();
-    let mut state = State::load()?;
-    if let Some(p) = state.projects.get_mut(&args.project_hash) {
-        if p.volume_id.as_ref() == Some(&volume_id) {
-            p.volume_id = None;
+    {
+        let _lock = StateLock::acquire().await?;
+        let mut state = State::load()?;
+        if let Some(p) = state.projects.get_mut(&args.project_hash) {
+            if p.volume_id.as_ref() == Some(&volume_id) {
+                p.volume_id = None;
+            }
+            crate::audit::end_volume_session(
+                p,
+                &args.project_hash,
+                &volume_id,
+                provider_name,
+                crate::audit::TerminationReason::Reap,
+            );
+            state.save().ok();
         }
-        crate::audit::end_volume_session(
-            p,
-            &args.project_hash,
-            &volume_id,
-            provider_name,
-            crate::audit::TerminationReason::Reap,
-        );
-        state.save().ok();
     }
     Ok(())
 }
