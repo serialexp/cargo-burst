@@ -105,12 +105,17 @@ const UBUNTU_MAGIC_NAME: &str = "ubuntu-24.04";
 /// find/delete it via the AWS console.
 const CARGO_BURST_SG_NAME: &str = "cargo-burst";
 
-/// AWS' `AttachVolume` API takes a Linux device name even though the
-/// kernel renames it on Nitro instances. `sdf` is the conventional
-/// first attached EBS device; the kernel will surface it as
-/// `/dev/nvme1n1` (or wherever NVMe ordering lands) but the stable
+/// AWS recommends `/dev/sd[f-p]` for additional EBS volumes
+/// (root sits on `/dev/sda1`, instance-store / NVMe use other slots).
+/// We pick the lowest unused letter at attach time so that mounting
+/// multiple project volumes on one shared server doesn't collide.
+/// On Nitro instances the kernel renames everything to `/dev/nvme*`
+/// anyway — the only consumer of this letter is AWS's own API
+/// bookkeeping; the stable `/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_*`
 /// symlink derives from the volume ID, not from this name.
-const ATTACH_DEVICE_NAME: &str = "/dev/sdf";
+const ATTACH_DEVICE_LETTERS: &[char] = &[
+    'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p',
+];
 
 // ── Struct ────────────────────────────────────────────────────────────
 
@@ -1151,6 +1156,49 @@ impl Provider for Ec2Provider {
             break; // Found in this region but not attached to target — fall through to attach.
         }
 
+        // Pick a free /dev/sd[f-p] slot. Multiple project volumes may
+        // be attached to the same shared server (one per project the
+        // user is working on); each needs a distinct device name on
+        // the AWS API side even though Nitro renames them to /dev/nvme*
+        // under the hood. We list current attachments on the target
+        // instance and pick the lowest unused letter.
+        let device_name = {
+            let mut name: Option<String> = None;
+            'pick: for region in &self.cfg.regions {
+                let ec2 = self.ec2(region).await;
+                let resp = match ec2
+                    .describe_instances()
+                    .instance_ids(srv.as_str())
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) if is_not_found(&e) => continue,
+                    Err(e) => return Err(sdk_err_to_anyhow(e, "describe_instances")),
+                };
+                let used: std::collections::HashSet<String> = resp
+                    .reservations()
+                    .iter()
+                    .flat_map(|r| r.instances())
+                    .filter(|i| i.instance_id() == Some(srv.as_str()))
+                    .flat_map(|i| i.block_device_mappings())
+                    .filter_map(|m| m.device_name().map(str::to_string))
+                    .collect();
+                for c in ATTACH_DEVICE_LETTERS {
+                    let candidate = format!("/dev/sd{c}");
+                    if !used.contains(&candidate) {
+                        name = Some(candidate);
+                        break 'pick;
+                    }
+                }
+            }
+            name.ok_or_else(|| anyhow!(
+                "no free /dev/sd[f-p] device slot on instance {srv} — \
+                 all {} positions are taken by other attachments",
+                ATTACH_DEVICE_LETTERS.len()
+            ))?
+        };
+
         // Volumes are AZ-scoped — we don't know which region without
         // a lookup. Walk regions until AttachVolume succeeds (or all
         // fail). Same shape as get_volume / get_server above.
@@ -1161,7 +1209,7 @@ impl Provider for Ec2Provider {
                 .attach_volume()
                 .volume_id(vol.as_str())
                 .instance_id(srv.as_str())
-                .device(ATTACH_DEVICE_NAME)
+                .device(&device_name)
                 .send()
                 .await
             {
