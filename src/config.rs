@@ -690,6 +690,15 @@ pub struct StateLock {
     _file: fs::File,
 }
 
+/// Hard cap on how long we'll wait for another process to drop the
+/// state lock. State writes are short — touch state.json, fsync, drop
+/// the lock — so the only way the lock is held longer than this is a
+/// crashed/wedged peer or a misbehaving long-running task holding it
+/// across an await (the reaper used to do this). Either way, the
+/// answer is "stop waiting and move on" rather than hang the user's
+/// `cargo burst` invocation forever.
+const LOCK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl StateLock {
     pub async fn acquire() -> Result<Self> {
         use fs2::FileExt;
@@ -702,18 +711,23 @@ impl StateLock {
             .open(&path)
             .with_context(|| format!("opening {}", path.display()))?;
 
-        let mut announced = false;
+        let deadline = std::time::Instant::now() + LOCK_WAIT_TIMEOUT;
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(Self { _file: file }),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if !announced {
-                        tracing::info!(
-                            "waiting for another cargo-burst process to release the state lock…"
-                        );
-                        announced = true;
+                    if std::time::Instant::now() >= deadline {
+                        return Err(anyhow!(
+                            "state lock {} held by another cargo-burst process for >{}s; \
+                             refusing to wait longer. State writes are supposed to be \
+                             short. If this keeps happening, a peer process is wedged — \
+                             try `pgrep -af cargo-burst` and kill any stale `__reap-*` \
+                             daemons.",
+                            path.display(),
+                            LOCK_WAIT_TIMEOUT.as_secs()
+                        ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
                 Err(e) => {
                     return Err(anyhow!("locking {}: {e}", path.display()));
