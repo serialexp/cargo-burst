@@ -345,6 +345,86 @@ curl -LsSf https://get.nexte.st/latest/linux \
     | tar zxf - -C ~/.cargo/bin
 EOFINNER
 
+# ── Pre-populate the cargo registry cache ────────────────────────────────
+#
+# The per-project volume gets wiped on reap (it holds target/ + sccache),
+# but the AMI persists. So anything baked into ~/.cargo/registry/ on the
+# AMI survives across volume churn and saves real time on every cold-volume
+# `cargo burst test`.
+#
+# We synthesize a Cargo project listing the heavyweights Bart actually
+# uses, then run `cargo fetch`. This populates:
+#   ~/.cargo/registry/index/   — the crates.io git index (the slow first-
+#                                run cost — ~10-15s of network on cold)
+#   ~/.cargo/registry/cache/   — .crate tarballs for every dep + transitive
+#
+# It does NOT touch target/ (we deliberately don't pre-build — rustc
+# version sensitivity makes that brittle, and per-project codegen options
+# would invalidate it anyway).
+#
+# The list is intentionally biased toward async/web/db crates — those have
+# the deepest dep trees and benefit most from skipping the network step.
+# Adjust by editing this script and re-baking. The cost of an over-broad
+# list is small (registry/cache/ is a few hundred MB of .crate files);
+# the cost of missing a dep is downloading it on first cold build.
+echo "[cargo-burst] pre-populating cargo registry cache"
+sudo -iu work bash <<'EOFINNER'
+set -euo pipefail
+source ~/.cargo/env
+mkdir -p /tmp/cargo-prefetch/src
+cat > /tmp/cargo-prefetch/Cargo.toml <<'TOML'
+[package]
+name = "cargo-burst-prefetch"
+version = "0.0.0"
+edition = "2021"
+
+# Common heavyweights. We don't actually compile this; `cargo fetch`
+# just resolves + downloads .crate tarballs and the registry index.
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "mysql", "sqlite", "macros", "migrate", "chrono", "uuid"] }
+sea-orm = { version = "1", features = ["runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql"] }
+redis = { version = "0.27", features = ["tokio-comp"] }
+aws-config = "1"
+aws-sdk-ec2 = "1"
+aws-sdk-s3 = "1"
+aws-sdk-sts = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures = "0.3"
+async-trait = "0.1"
+parking_lot = "0.12"
+dashmap = "6"
+once_cell = "1"
+regex = "1"
+url = "2"
+bytes = "1"
+fs2 = "0.4"
+dirs = "5"
+
+[lib]
+path = "src/lib.rs"
+TOML
+echo "// placeholder" > /tmp/cargo-prefetch/src/lib.rs
+cd /tmp/cargo-prefetch
+cargo fetch --locked 2>/dev/null || cargo fetch
+cd /
+rm -rf /tmp/cargo-prefetch
+EOFINNER
+echo "[cargo-burst] cargo registry cache size: $(du -sh /home/work/.cargo/registry 2>/dev/null | cut -f1)"
+
 # Mountpoint + helper script the controller invokes after attach to mount
 # the project's volume at /mnt/cache. ext4 mkfs is automatic via the
 # Hetzner volume-create flow, so we only mount here.
