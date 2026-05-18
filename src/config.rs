@@ -327,6 +327,16 @@ pub struct State {
     /// Session accounting for the currently-alive shared server.
     #[serde(default)]
     pub current_server_session: Option<ServerSession>,
+    /// RFC3339 timestamp claimed by the cargo-burst process currently
+    /// in `ensure_shared_server`'s create path. While this is set, other
+    /// concurrent invocations see it during their brief Phase 1 lock and
+    /// poll until either (a) `server_id` becomes populated (claimant
+    /// succeeded — they reuse the just-created server) or (b) this
+    /// timestamp drifts past `PROVISIONING_STALE_AFTER_SECS` (claimant
+    /// crashed — they steal the slot). Cleared by the claimant when
+    /// provisioning finishes (success or failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_provisioning_started_at: Option<String>,
 }
 
 /// In-flight accounting for a single server lifetime. Persisted to

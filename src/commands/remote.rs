@@ -39,6 +39,18 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// SSH come-up window after the server reports "running".
 const SSH_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long a `server_provisioning_started_at` marker is treated as
+/// "still in flight" by waiters. If the claimant takes longer than this
+/// without writing a `server_id` (probably crashed), the next arrival
+/// steals the slot rather than waiting forever. Sized to be comfortably
+/// larger than a normal provision (~25s on AWS, ~50s on Hetzner) so we
+/// don't false-positive on a slightly-slow run.
+const PROVISIONING_STALE_AFTER_SECS: i64 = 180;
+
+/// How often a waiter re-checks `state.json` for either `server_id`
+/// becoming populated or the provisioning marker going stale.
+const PROVISIONING_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// What a subcommand needs in order to talk to the prepared remote.
 /// Passed into the closure given to [`with_remote`].
 pub struct RemoteCtx {
@@ -156,97 +168,77 @@ where
     // someone else was provisioning. The 2s lock-acquire timeout would
     // then trip and fail the command outright.)
     //
-    //   Phase 1 (brief lock): ensure this project's entry exists,
-    //     snapshot `image_id`, persist the new entry so concurrent
-    //     readers can see it.
+    //   Phase 1 (brief lock, claim-or-wait): ensure this project's
+    //     entry exists, snapshot `image_id`. If `state.server_id` is
+    //     already populated, fast-path through. Otherwise either claim
+    //     the provisioning slot by writing `server_provisioning_started_at`,
+    //     or — if another process has claimed it — drop the lock and
+    //     poll every 5s until the slot clears (then re-enter the loop;
+    //     usually we'll see the new `server_id` and fast-path).
     //
     //   Phase 2 (NO lock): scan/prompt for excludes, ensure the
     //     provider-side SSH key, peek at existing volume region,
     //     create/reuse the shared server, create/reuse the volume,
     //     attach it. These all mutate a *local* `State` snapshot.
     //
-    //   Phase 3 (brief lock, end of function): merge the fields we
-    //     own back into the canonical state under `update_state`.
-    //
-    // Trade-off: dropping the lock during provisioning means two
-    // concurrent `cargo burst <X>` invocations (in distinct cwds, both
-    // hitting a freshly-empty `state.json`) could each call
-    // `provider.create_server` before either has written
-    // `state.server_id` — leaking one EC2 instance until the reaper
-    // catches up. In practice this requires racing two terminals
-    // within the ~25s provision window, with no shared server already
-    // running. Acceptable; the alternative (a global mutex on every
-    // command) is worse.
+    //   Phase 3 (brief lock via update_state): merge the fields we own
+    //     back into the canonical state. Always clears the provisioning
+    //     marker if we were the claimant — including on the error path,
+    //     so a failed run doesn't wedge concurrent peers.
     let ssh_key_path = cfg.ssh_key_path()?;
     let pubkey = ssh::ensure_ssh_key(&ssh_key_path).await?;
 
-    // ── Phase 1: ensure project entry, snapshot image_id ────────────────
-    let (image_id, mut state) = {
-        let _lock = StateLock::acquire().await?;
-        let mut s = State::load()?;
-        s.projects
-            .entry(project.hash.clone())
-            .or_insert_with(|| ProjectState {
-                workspace_path: project.workspace_root.display().to_string(),
-                volume_id: None,
-                last_used_rfc3339: None,
-                excludes: None,
-                volume_started_at: None,
-            });
-        let image_id = s
-            .image_id
-            .clone()
-            .ok_or_else(|| anyhow!("no baked image yet — run `cargo burst image build` first"))?;
-        // Persist the project entry now so a concurrent `status` /
-        // `audit` reader sees this project exists. The rest of the
-        // mutations happen on the local snapshot and get merged in
-        // Phase 3.
-        s.save()?;
-        (image_id, s)
-        // _lock drops here.
-    };
+    // ── Phase 1: ensure project entry, claim or wait, snapshot image_id ──
+    let (image_id, mut state, claimed_provisioning) = claim_or_wait_for_provisioning(&project).await?;
 
     // ── Phase 2: API work, no lock held ─────────────────────────────────
-    let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
+    //
+    // Wrapped in an async block so we can ALWAYS clear the provisioning
+    // marker afterward, whether Phase 2 succeeds or errors out.
+    let phase2_result: Result<_> = async {
+        let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
 
-    // Local size summary + (on first run) confirm excludes. Doing
-    // it before provisioning means the user sees what's about to
-    // be sync'd before any cloud resources are created — and lets
-    // us bail early if they Ctrl-C at the prompt. Holds no lock,
-    // so a parallel `status` from another terminal Just Works even
-    // if the user is sitting at the prompt.
-    let extra_excludes = scan_and_confirm_excludes(&cfg, &project, &mut state, opts.yes)?;
+        // Local size summary + (on first run) confirm excludes. Doing
+        // it before provisioning means the user sees what's about to
+        // be sync'd before any cloud resources are created — and lets
+        // us bail early if they Ctrl-C at the prompt. Holds no lock,
+        // so a parallel `status` from another terminal Just Works even
+        // if the user is sitting at the prompt.
+        let extra_excludes = scan_and_confirm_excludes(&cfg, &project, &mut state, opts.yes)?;
 
-    // Region-fallback path. We have to know the *server's* region
-    // before creating/reusing a volume, because Hetzner volumes are
-    // regional — a hel1 volume can't attach to a fsn1 server. So:
-    //   1. Peek at any existing volume's region (no state writes).
-    //   2. Compute the order in which to attempt regions: that
-    //      volume's region first (so we keep the cache when we can),
-    //      then the user's preference list, deduped.
-    //   3. Provision (or reuse) the server, falling through capacity
-    //      errors to the next region.
-    //   4. Match the volume to the server's actual region: existing
-    //      volume in the right region → reuse; wrong region → delete
-    //      and recreate (build cache rebuilds in ~30s, the alternative
-    //      is failing the build entirely).
-    let existing_volume_region =
-        peek_volume_region(provider.as_ref(), &project, &state).await;
-    let attempt_regions = compute_attempt_regions(&cfg, existing_volume_region.as_deref());
-    let (server, fresh_server, server_region) = ensure_shared_server(
-        provider.as_ref(),
-        &cfg,
-        &image_id,
-        &ssh_key_id,
-        &mut state,
-        &attempt_regions,
-    )
-    .await?;
-    let (volume, fresh_volume) =
-        ensure_volume(provider.as_ref(), &cfg, &project, &mut state, &server_region).await?;
-    let device = ensure_volume_attached(provider.as_ref(), &volume, &server.id).await?;
+        // Region-fallback path. We have to know the *server's* region
+        // before creating/reusing a volume, because Hetzner volumes are
+        // regional — a hel1 volume can't attach to a fsn1 server. So:
+        //   1. Peek at any existing volume's region (no state writes).
+        //   2. Compute the order in which to attempt regions: that
+        //      volume's region first (so we keep the cache when we can),
+        //      then the user's preference list, deduped.
+        //   3. Provision (or reuse) the server, falling through capacity
+        //      errors to the next region.
+        //   4. Match the volume to the server's actual region: existing
+        //      volume in the right region → reuse; wrong region → delete
+        //      and recreate (build cache rebuilds in ~30s, the alternative
+        //      is failing the build entirely).
+        let existing_volume_region =
+            peek_volume_region(provider.as_ref(), &project, &state).await;
+        let attempt_regions = compute_attempt_regions(&cfg, existing_volume_region.as_deref());
+        let (server, fresh_server, server_region) = ensure_shared_server(
+            provider.as_ref(),
+            &cfg,
+            &image_id,
+            &ssh_key_id,
+            &mut state,
+            &attempt_regions,
+        )
+        .await?;
+        let (volume, fresh_volume) =
+            ensure_volume(provider.as_ref(), &cfg, &project, &mut state, &server_region).await?;
+        let device = ensure_volume_attached(provider.as_ref(), &volume, &server.id).await?;
+        Ok((server, fresh_server, volume, fresh_volume, device, extra_excludes))
+    }
+    .await;
 
-    // ── Phase 3a: merge provisioning mutations back into canonical state ─
+    // ── Phase 3: merge provisioning mutations back into canonical state ──
     //
     // We "own" the fields below for this project. `update_state` takes
     // the lock briefly, re-reads the on-disk state (so we don't blow
@@ -254,25 +246,45 @@ where
     // our snapshot's view of those fields in. Bumping `last_used`
     // immediately defends against a reaper firing mid-our-run — see
     // reap.rs's "(2) Activity-since-spawn" logic.
+    //
+    // Crucially this runs whether Phase 2 succeeded or failed — so a
+    // failed run still clears the provisioning marker (if we set it),
+    // unblocking concurrent peers immediately instead of making them
+    // wait out the staleness timeout.
     let hash_for_merge = project.hash.clone();
+    let phase2_ok = phase2_result.is_ok();
     let new_server_id = state.server_id.clone();
     let new_server_session = state.current_server_session.clone();
     let project_snapshot = state.projects.get(&hash_for_merge).cloned();
-    config::update_state(move |s| {
-        s.server_id = new_server_id;
-        s.current_server_session = new_server_session;
-        if let Some(snap) = project_snapshot {
-            let entry = s.projects.entry(hash_for_merge.clone()).or_insert_with(|| snap.clone());
-            entry.volume_id = snap.volume_id;
-            entry.excludes = snap.excludes;
-            entry.volume_started_at = snap.volume_started_at;
-            entry.last_used_rfc3339 = Some(now_rfc3339());
-            // workspace_path is set when the project entry is first
-            // created in Phase 1; nothing to merge here.
+    if let Err(e) = config::update_state(move |s| {
+        if claimed_provisioning {
+            s.server_provisioning_started_at = None;
+        }
+        if phase2_ok {
+            s.server_id = new_server_id;
+            s.current_server_session = new_server_session;
+            if let Some(snap) = project_snapshot {
+                let entry = s
+                    .projects
+                    .entry(hash_for_merge.clone())
+                    .or_insert_with(|| snap.clone());
+                entry.volume_id = snap.volume_id;
+                entry.excludes = snap.excludes;
+                entry.volume_started_at = snap.volume_started_at;
+                entry.last_used_rfc3339 = Some(now_rfc3339());
+                // workspace_path is set when the project entry is first
+                // created in Phase 1; nothing to merge here.
+            }
         }
         Ok(())
     })
-    .await?;
+    .await
+    {
+        // Best-effort. If we can't take the lock to merge, log it but
+        // still propagate the underlying Phase 2 result.
+        tracing::warn!("failed to merge provisioning state: {e}");
+    }
+    let (server, fresh_server, volume, fresh_volume, device, extra_excludes) = phase2_result?;
 
     let server_ip = server
         .public_ip
@@ -483,6 +495,119 @@ fn spawn_heartbeat(project_hash: String) -> HeartbeatGuard {
 }
 
 // ── Provisioning helpers ──────────────────────────────────────────────
+
+/// Phase 1: acquire a snapshot of state for the calling invocation,
+/// either by reusing an already-provisioned server, by claiming the
+/// provisioning slot, or by waiting for a peer to finish.
+///
+/// Returns `(image_id, state_snapshot, claimed_provisioning)`.
+/// `claimed_provisioning == true` means *we* wrote
+/// `server_provisioning_started_at` and we are responsible for clearing
+/// it in Phase 3 (success OR failure). `false` means either we
+/// fast-pathed on an already-populated `server_id` or another process
+/// did the provisioning and we just woke up to its result; either way,
+/// no marker cleanup is required from us.
+///
+/// The loop terminates as soon as one of three things is true:
+///   - `state.server_id` is `Some` (something is already provisioned —
+///     ensure_shared_server will validate it's alive shortly).
+///   - The provisioning slot is free (no marker, or stale marker), and
+///     we successfully claim it.
+///   - An I/O error bubbles up from `State::load` or `state.save`.
+///
+/// `PROVISIONING_POLL_INTERVAL` (5s) is the wait granularity. A
+/// "Waiting for shared server provisioning by another cargo-burst
+/// process…" line is printed exactly once on the first wait so the user
+/// understands why the command isn't progressing; subsequent polls are
+/// silent to avoid spam. On exit from a wait, we log how long we waited.
+async fn claim_or_wait_for_provisioning(
+    project: &ProjectKey,
+) -> Result<(crate::provider::ImageId, State, bool)> {
+    let mut wait_started: Option<Instant> = None;
+    loop {
+        let outcome = {
+            let _lock = StateLock::acquire().await?;
+            let mut s = State::load()?;
+            s.projects
+                .entry(project.hash.clone())
+                .or_insert_with(|| ProjectState {
+                    workspace_path: project.workspace_root.display().to_string(),
+                    volume_id: None,
+                    last_used_rfc3339: None,
+                    excludes: None,
+                    volume_started_at: None,
+                });
+            let image_id = s.image_id.clone().ok_or_else(|| {
+                anyhow!("no baked image yet — run `cargo burst image build` first")
+            })?;
+            // Fast path: someone (us, last run; or a peer that just
+            // finished) has a server in state. ensure_shared_server
+            // will check it's alive and act accordingly.
+            if s.server_id.is_some() {
+                s.save()?;
+                Phase1Outcome::Proceed { image_id, state: s, claimed: false }
+            } else {
+                let now = now_rfc3339();
+                let should_claim = match s.server_provisioning_started_at.as_deref() {
+                    None => true,
+                    Some(ts) => is_marker_stale(ts, &now),
+                };
+                if should_claim {
+                    s.server_provisioning_started_at = Some(now);
+                    s.save()?;
+                    Phase1Outcome::Proceed { image_id, state: s, claimed: true }
+                } else {
+                    // Someone else holds the slot. Drop the lock and poll.
+                    Phase1Outcome::Wait
+                }
+            }
+            // _lock drops here whatever branch we took.
+        };
+
+        match outcome {
+            Phase1Outcome::Proceed { image_id, state, claimed } => {
+                if let Some(t0) = wait_started {
+                    let waited = t0.elapsed();
+                    tracing::info!(
+                        waited_secs = waited.as_secs_f64(),
+                        "peer finished provisioning shared server; continuing"
+                    );
+                }
+                return Ok((image_id, state, claimed));
+            }
+            Phase1Outcome::Wait => {
+                if wait_started.is_none() {
+                    wait_started = Some(Instant::now());
+                    println!(
+                        "Waiting for shared server provisioning by another cargo-burst process… \
+                         (polling state.json every {}s)",
+                        PROVISIONING_POLL_INTERVAL.as_secs()
+                    );
+                }
+                tokio::time::sleep(PROVISIONING_POLL_INTERVAL).await;
+            }
+        }
+    }
+}
+
+enum Phase1Outcome {
+    Proceed { image_id: crate::provider::ImageId, state: State, claimed: bool },
+    Wait,
+}
+
+/// True if the RFC3339 timestamp `ts` is older than
+/// `PROVISIONING_STALE_AFTER_SECS` relative to `now`. Parse failures
+/// are treated as "stale" — better to steal a malformed slot than
+/// wedge forever on bad state.
+fn is_marker_stale(ts: &str, now: &str) -> bool {
+    let parse = |s: &str| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+    };
+    match (parse(ts), parse(now)) {
+        (Some(then), Some(now_t)) => (now_t - then).whole_seconds() > PROVISIONING_STALE_AFTER_SECS,
+        _ => true,
+    }
+}
 
 /// Read the project's existing volume's region without touching state.
 /// Used to bias the region-attempt order toward "wherever the cache
@@ -1481,6 +1606,35 @@ mod tests {
         );
         // Sanity: other defaults are still present.
         assert!(merged.iter().any(|p| p == "target/"));
+    }
+
+    #[test]
+    fn is_marker_stale_returns_false_for_fresh_marker() {
+        // 10s old — well under the 180s staleness threshold.
+        let now = time::OffsetDateTime::now_utc();
+        let then = now - time::Duration::seconds(10);
+        let now_s = now.format(&time::format_description::well_known::Rfc3339).unwrap();
+        let then_s = then.format(&time::format_description::well_known::Rfc3339).unwrap();
+        assert!(!is_marker_stale(&then_s, &now_s));
+    }
+
+    #[test]
+    fn is_marker_stale_returns_true_past_threshold() {
+        // 200s old — past the 180s threshold; another arrival should
+        // assume the claimant crashed and steal the slot.
+        let now = time::OffsetDateTime::now_utc();
+        let then = now - time::Duration::seconds(200);
+        let now_s = now.format(&time::format_description::well_known::Rfc3339).unwrap();
+        let then_s = then.format(&time::format_description::well_known::Rfc3339).unwrap();
+        assert!(is_marker_stale(&then_s, &now_s));
+    }
+
+    #[test]
+    fn is_marker_stale_returns_true_for_unparseable_marker() {
+        // Garbage in state.json should not block forever — treat as stale.
+        let now = time::OffsetDateTime::now_utc();
+        let now_s = now.format(&time::format_description::well_known::Rfc3339).unwrap();
+        assert!(is_marker_stale("not-a-timestamp", &now_s));
     }
 
     #[test]
