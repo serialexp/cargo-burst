@@ -147,19 +147,44 @@ where
     // after `wait_for_ssh` returns (when the box is actually ready).
     let provision_start = Instant::now();
 
-    // Provisioning block: image check, ssh key, scan, volume, server,
-    // attach. Held under the state lock so two concurrent burst commands
-    // can't each spin up their own CCX63 (Hetzner happily creates two
-    // servers with the same name) or clobber each other's saves with
-    // stale in-memory state.
+    // Provisioning runs in three phases re: the state lock. The state
+    // lock protects only short read-modify-write windows on
+    // `state.json`; it does NOT serialize the long-running provider
+    // calls below. (An earlier design held the lock across everything,
+    // which made every concurrent `cargo burst …` invocation — even
+    // read-only `status` / `audit` — block for tens of seconds while
+    // someone else was provisioning. The 2s lock-acquire timeout would
+    // then trip and fail the command outright.)
+    //
+    //   Phase 1 (brief lock): ensure this project's entry exists,
+    //     snapshot `image_id`, persist the new entry so concurrent
+    //     readers can see it.
+    //
+    //   Phase 2 (NO lock): scan/prompt for excludes, ensure the
+    //     provider-side SSH key, peek at existing volume region,
+    //     create/reuse the shared server, create/reuse the volume,
+    //     attach it. These all mutate a *local* `State` snapshot.
+    //
+    //   Phase 3 (brief lock, end of function): merge the fields we
+    //     own back into the canonical state under `update_state`.
+    //
+    // Trade-off: dropping the lock during provisioning means two
+    // concurrent `cargo burst <X>` invocations (in distinct cwds, both
+    // hitting a freshly-empty `state.json`) could each call
+    // `provider.create_server` before either has written
+    // `state.server_id` — leaking one EC2 instance until the reaper
+    // catches up. In practice this requires racing two terminals
+    // within the ~25s provision window, with no shared server already
+    // running. Acceptable; the alternative (a global mutex on every
+    // command) is worse.
     let ssh_key_path = cfg.ssh_key_path()?;
     let pubkey = ssh::ensure_ssh_key(&ssh_key_path).await?;
-    let (server, fresh_server, volume, device, fresh_volume, extra_excludes) = {
-        let _lock = StateLock::acquire().await?;
-        let mut state = State::load()?;
 
-        state
-            .projects
+    // ── Phase 1: ensure project entry, snapshot image_id ────────────────
+    let (image_id, mut state) = {
+        let _lock = StateLock::acquire().await?;
+        let mut s = State::load()?;
+        s.projects
             .entry(project.hash.clone())
             .or_insert_with(|| ProjectState {
                 workspace_path: project.workspace_root.display().to_string(),
@@ -168,61 +193,86 @@ where
                 excludes: None,
                 volume_started_at: None,
             });
-
-        let image_id = state
+        let image_id = s
             .image_id
             .clone()
             .ok_or_else(|| anyhow!("no baked image yet — run `cargo burst image build` first"))?;
-
-        let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
-
-        // Local size summary + (on first run) confirm excludes. Doing
-        // it before provisioning means the user sees what's about to
-        // be sync'd before any cloud resources are created — and lets
-        // us bail early if they Ctrl-C at the prompt.
-        let extra_excludes = scan_and_confirm_excludes(&cfg, &project, &mut state, opts.yes)?;
-
-        // Region-fallback path. We have to know the *server's* region
-        // before creating/reusing a volume, because Hetzner volumes are
-        // regional — a hel1 volume can't attach to a fsn1 server. So:
-        //   1. Peek at any existing volume's region (no state writes).
-        //   2. Compute the order in which to attempt regions: that
-        //      volume's region first (so we keep the cache when we can),
-        //      then the user's preference list, deduped.
-        //   3. Provision (or reuse) the server, falling through capacity
-        //      errors to the next region.
-        //   4. Match the volume to the server's actual region: existing
-        //      volume in the right region → reuse; wrong region → delete
-        //      and recreate (build cache rebuilds in ~30s, the alternative
-        //      is failing the build entirely).
-        let existing_volume_region =
-            peek_volume_region(provider.as_ref(), &project, &state).await;
-        let attempt_regions =
-            compute_attempt_regions(&cfg, existing_volume_region.as_deref());
-        let (server, fresh_server, server_region) = ensure_shared_server(
-            provider.as_ref(),
-            &cfg,
-            &image_id,
-            &ssh_key_id,
-            &mut state,
-            &attempt_regions,
-        )
-        .await?;
-        let (volume, fresh_volume) =
-            ensure_volume(provider.as_ref(), &cfg, &project, &mut state, &server_region).await?;
-        let device = ensure_volume_attached(provider.as_ref(), &volume, &server.id).await?;
-
-        // Bump this project's last_used immediately — see reap.rs's
-        // "(2) Activity-since-spawn" logic. Without this, a previous
-        // reaper firing mid-our-run would happily delete the server
-        // out from under us.
-        if let Some(p) = state.projects.get_mut(&project.hash) {
-            p.last_used_rfc3339 = Some(now_rfc3339());
-        }
-        state.save()?;
-        (server, fresh_server, volume, device, fresh_volume, extra_excludes)
-        // _lock drops here; concurrent runs can now provision.
+        // Persist the project entry now so a concurrent `status` /
+        // `audit` reader sees this project exists. The rest of the
+        // mutations happen on the local snapshot and get merged in
+        // Phase 3.
+        s.save()?;
+        (image_id, s)
+        // _lock drops here.
     };
+
+    // ── Phase 2: API work, no lock held ─────────────────────────────────
+    let ssh_key_id = provider.ensure_ssh_key("cargo-burst", &pubkey).await?;
+
+    // Local size summary + (on first run) confirm excludes. Doing
+    // it before provisioning means the user sees what's about to
+    // be sync'd before any cloud resources are created — and lets
+    // us bail early if they Ctrl-C at the prompt. Holds no lock,
+    // so a parallel `status` from another terminal Just Works even
+    // if the user is sitting at the prompt.
+    let extra_excludes = scan_and_confirm_excludes(&cfg, &project, &mut state, opts.yes)?;
+
+    // Region-fallback path. We have to know the *server's* region
+    // before creating/reusing a volume, because Hetzner volumes are
+    // regional — a hel1 volume can't attach to a fsn1 server. So:
+    //   1. Peek at any existing volume's region (no state writes).
+    //   2. Compute the order in which to attempt regions: that
+    //      volume's region first (so we keep the cache when we can),
+    //      then the user's preference list, deduped.
+    //   3. Provision (or reuse) the server, falling through capacity
+    //      errors to the next region.
+    //   4. Match the volume to the server's actual region: existing
+    //      volume in the right region → reuse; wrong region → delete
+    //      and recreate (build cache rebuilds in ~30s, the alternative
+    //      is failing the build entirely).
+    let existing_volume_region =
+        peek_volume_region(provider.as_ref(), &project, &state).await;
+    let attempt_regions = compute_attempt_regions(&cfg, existing_volume_region.as_deref());
+    let (server, fresh_server, server_region) = ensure_shared_server(
+        provider.as_ref(),
+        &cfg,
+        &image_id,
+        &ssh_key_id,
+        &mut state,
+        &attempt_regions,
+    )
+    .await?;
+    let (volume, fresh_volume) =
+        ensure_volume(provider.as_ref(), &cfg, &project, &mut state, &server_region).await?;
+    let device = ensure_volume_attached(provider.as_ref(), &volume, &server.id).await?;
+
+    // ── Phase 3a: merge provisioning mutations back into canonical state ─
+    //
+    // We "own" the fields below for this project. `update_state` takes
+    // the lock briefly, re-reads the on-disk state (so we don't blow
+    // away unrelated changes another concurrent run made), and merges
+    // our snapshot's view of those fields in. Bumping `last_used`
+    // immediately defends against a reaper firing mid-our-run — see
+    // reap.rs's "(2) Activity-since-spawn" logic.
+    let hash_for_merge = project.hash.clone();
+    let new_server_id = state.server_id.clone();
+    let new_server_session = state.current_server_session.clone();
+    let project_snapshot = state.projects.get(&hash_for_merge).cloned();
+    config::update_state(move |s| {
+        s.server_id = new_server_id;
+        s.current_server_session = new_server_session;
+        if let Some(snap) = project_snapshot {
+            let entry = s.projects.entry(hash_for_merge.clone()).or_insert_with(|| snap.clone());
+            entry.volume_id = snap.volume_id;
+            entry.excludes = snap.excludes;
+            entry.volume_started_at = snap.volume_started_at;
+            entry.last_used_rfc3339 = Some(now_rfc3339());
+            // workspace_path is set when the project entry is first
+            // created in Phase 1; nothing to merge here.
+        }
+        Ok(())
+    })
+    .await?;
 
     let server_ip = server
         .public_ip
